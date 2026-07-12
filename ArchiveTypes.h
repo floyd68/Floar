@@ -32,7 +32,7 @@ namespace ArchiveTypes
 #if FLOAR_ENABLE_COMMON_ARCHIVES
             L".zip", L".7z", L".rar",
 #endif
-            L".ba2"
+            L".bsa", L".ba2"
         };
         return exts;
     }

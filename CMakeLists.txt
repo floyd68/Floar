@@ -141,6 +141,7 @@ target_sources(Floar PRIVATE
     FloarLog.cpp
     VirtualFileSystem.cpp
     VirtualPath.cpp
+    external/lz4/lz4.c
 )
 
 target_include_directories(Floar
@@ -149,6 +150,7 @@ target_include_directories(Floar
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/external/zlib
         ${CMAKE_CURRENT_BINARY_DIR}/external/zlib
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/lz4
 )
 
 target_compile_definitions(Floar

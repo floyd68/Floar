@@ -6,7 +6,7 @@ Virtual path / virtual file system and archive readers (BA2, ZIP, 7z, RAR).
 
 - `Floar::VirtualPath` — filesystem or archive-inner path
 - `Floar::VirtualFileSystem` — list / read / is-directory across disk and archives
-- `Floar::ArchiveReaderFactory` — BA2 (hand-rolled) + optional libarchive ZIP/7z/RAR
+- `Floar::ArchiveReaderFactory` — BSA (v103/v104/v105) + BA2 (hand-rolled) + optional libarchive ZIP/7z/RAR
 - `Floar::Log::SetSink` — optional log sink (no-op until installed)
 
 ## Build

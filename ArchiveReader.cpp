@@ -28,6 +28,8 @@
 #define FLOAR_HAS_ZLIB 0
 #endif
 
+#include "lz4.h"
+
 #ifdef max
 #undef max
 #endif
@@ -301,6 +303,59 @@ namespace
 
         FLOAR_LOG_WARN("[BA2] Raw deflate also failed.");
         return {};
+    }
+
+    std::vector<uint8_t> DecompressLz4(
+        const std::vector<uint8_t>& compressed,
+        uint32_t expectedSize)
+    {
+        std::vector<uint8_t> output;
+        if (compressed.empty() || expectedSize == 0 || expectedSize > kMaxBa2InflateBytes)
+        {
+            FLOAR_LOG_WARN("[BSA] LZ4 decompress skipped: invalid sizes.");
+            return output;
+        }
+
+        output.resize(expectedSize);
+        const int decoded = LZ4_decompress_safe(
+            reinterpret_cast<const char*>(compressed.data()),
+            reinterpret_cast<char*>(output.data()),
+            static_cast<int>(compressed.size()),
+            static_cast<int>(expectedSize));
+        if (decoded <= 0 || static_cast<uint32_t>(decoded) > expectedSize)
+        {
+            FLOAR_LOG_WARN("[BSA] LZ4 decompress failed.");
+            output.clear();
+            return output;
+        }
+
+        output.resize(static_cast<size_t>(decoded));
+        return output;
+    }
+
+    bool ReadBzString(std::ifstream& stream, std::string& out)
+    {
+        uint8_t len = 0;
+        if (!ReadValue(stream, len))
+        {
+            return false;
+        }
+        if (len == 0)
+        {
+            out.clear();
+            return true;
+        }
+
+        out.assign(static_cast<size_t>(len), '\0');
+        if (!ReadBytes(stream, out.data(), out.size()))
+        {
+            return false;
+        }
+        if (!out.empty() && out.back() == '\0')
+        {
+            out.pop_back();
+        }
+        return true;
     }
 }
 
@@ -859,6 +914,403 @@ private:
     }
 };
 
+class BsaReader : public IArchiveReader
+{
+    static constexpr uint32_t kHeaderSize = 36;
+    static constexpr uint32_t kSizeCompressionFlip = 0x40000000u;
+    static constexpr uint32_t kFlagIncludeDirectoryNames = 0x1u;
+    static constexpr uint32_t kFlagIncludeFileNames = 0x2u;
+    static constexpr uint32_t kFlagDefaultCompressed = 0x4u;
+    static constexpr uint32_t kFlagXboxArchive = 0x40u;
+    static constexpr uint32_t kFlagEmbedFileNames = 0x100u;
+    static constexpr uint32_t kFlagXMemCodec = 0x200u;
+
+    struct BsaFileInfo
+    {
+        std::wstring name;
+        uint64_t offset = 0;
+        uint32_t rawSizeField = 0;
+        uint32_t reportedSize = 0;
+        bool compressed = false;
+    };
+
+    std::filesystem::path m_path;
+    std::vector<ArchiveEntry> m_entries;
+    std::unordered_map<std::wstring, size_t> m_entryMap;
+    std::vector<BsaFileInfo> m_files;
+    uint32_t m_version = 0;
+    uint32_t m_archiveFlags = 0;
+    std::wstring m_formatName { L"BSA" };
+
+public:
+    explicit BsaReader(const std::filesystem::path& path)
+        : m_path(path)
+    {
+        ScanArchive();
+    }
+
+    std::vector<ArchiveEntry> ListEntries() override
+    {
+        return m_entries;
+    }
+
+    std::vector<uint8_t> ExtractToMemory(const std::wstring& entryPath) override
+    {
+        const std::wstring key = Floar::StringUtil::ToLower(NormalizeArchivePath(entryPath));
+        auto it = m_entryMap.find(key);
+        if (it == m_entryMap.end())
+        {
+            return {};
+        }
+        return ExtractFile(m_files[it->second]);
+    }
+
+    bool HasEntry(const std::wstring& entryPath) override
+    {
+        return m_entryMap.find(Floar::StringUtil::ToLower(NormalizeArchivePath(entryPath))) != m_entryMap.end();
+    }
+
+    std::wstring GetFormatName() const override
+    {
+        return m_formatName;
+    }
+
+private:
+    bool EmbedFileNames() const
+    {
+        // Embedded names appear in v104/v105 file data blocks when bit 9 is set.
+        return m_version >= 104 && (m_archiveFlags & kFlagEmbedFileNames) != 0;
+    }
+
+    bool DefaultCompressed() const
+    {
+        return (m_archiveFlags & kFlagDefaultCompressed) != 0;
+    }
+
+    std::vector<uint8_t> ExtractFile(const BsaFileInfo& info) const
+    {
+        std::ifstream stream(m_path, std::ios::binary);
+        if (!stream)
+        {
+            FLOAR_LOG_WARN("[BSA] Failed to open archive for extract.");
+            return {};
+        }
+
+        stream.seekg(static_cast<std::streamoff>(info.offset), std::ios::beg);
+        if (!stream.good())
+        {
+            FLOAR_LOG_WARN("[BSA] Seek to file data failed.");
+            return {};
+        }
+
+        uint32_t remaining = info.reportedSize;
+        if (EmbedFileNames())
+        {
+            std::string embedded;
+            if (!ReadBzString(stream, embedded))
+            {
+                FLOAR_LOG_WARN("[BSA] Failed to skip embedded file name.");
+                return {};
+            }
+            // bzstring on disk: 1 length byte + N bytes where N includes trailing NUL.
+            const uint32_t onDiskNameBytes = static_cast<uint32_t>(embedded.size()) + 2u;
+            if (remaining < onDiskNameBytes)
+            {
+                FLOAR_LOG_WARN("[BSA] Embedded name larger than file size field.");
+                return {};
+            }
+            remaining -= onDiskNameBytes;
+        }
+
+        if (!info.compressed)
+        {
+            if (remaining == 0)
+            {
+                return {};
+            }
+            std::vector<uint8_t> data(remaining);
+            if (!ReadBytes(stream, data.data(), data.size()))
+            {
+                FLOAR_LOG_WARN("[BSA] Failed to read uncompressed file data.");
+                return {};
+            }
+            return data;
+        }
+
+        if (remaining < sizeof(uint32_t))
+        {
+            FLOAR_LOG_WARN("[BSA] Compressed block too small for original size.");
+            return {};
+        }
+
+        uint32_t originalSize = 0;
+        if (!ReadValue(stream, originalSize))
+        {
+            FLOAR_LOG_WARN("[BSA] Failed to read original size.");
+            return {};
+        }
+        remaining -= sizeof(uint32_t);
+
+        if (originalSize == 0 || originalSize > kMaxBa2InflateBytes || remaining == 0)
+        {
+            FLOAR_LOG_WARN("[BSA] Invalid compressed payload sizes.");
+            return {};
+        }
+
+        std::vector<uint8_t> compressed(remaining);
+        if (!ReadBytes(stream, compressed.data(), compressed.size()))
+        {
+            FLOAR_LOG_WARN("[BSA] Failed to read compressed payload.");
+            return {};
+        }
+
+        if (m_version >= 105)
+        {
+            return DecompressLz4(compressed, originalSize);
+        }
+        return DecompressZlib(compressed, originalSize);
+    }
+
+    void ScanArchive()
+    {
+        std::ifstream stream(m_path, std::ios::binary);
+        if (!stream)
+        {
+            FLOAR_LOG_WARN("[BSA] Failed to open archive file.");
+            return;
+        }
+
+        char magic[4] {};
+        uint32_t version = 0;
+        uint32_t folderOffset = 0;
+        uint32_t archiveFlags = 0;
+        uint32_t folderCount = 0;
+        uint32_t fileCount = 0;
+        uint32_t totalFolderNameLength = 0;
+        uint32_t totalFileNameLength = 0;
+        uint16_t fileFlags = 0;
+        uint16_t padding = 0;
+
+        if (!ReadBytes(stream, magic, sizeof(magic)) ||
+            !ReadValue(stream, version) ||
+            !ReadValue(stream, folderOffset) ||
+            !ReadValue(stream, archiveFlags) ||
+            !ReadValue(stream, folderCount) ||
+            !ReadValue(stream, fileCount) ||
+            !ReadValue(stream, totalFolderNameLength) ||
+            !ReadValue(stream, totalFileNameLength) ||
+            !ReadValue(stream, fileFlags) ||
+            !ReadValue(stream, padding))
+        {
+            FLOAR_LOG_WARN("[BSA] Failed to read header.");
+            return;
+        }
+
+        if (!(magic[0] == 'B' && magic[1] == 'S' && magic[2] == 'A' && magic[3] == '\0'))
+        {
+            FLOAR_LOG_WARN("[BSA] Invalid BSA magic.");
+            return;
+        }
+
+        if (version != 103 && version != 104 && version != 105)
+        {
+            FLOAR_LOG_WARN("[BSA] Unsupported BSA version {}.", version);
+            return;
+        }
+
+        if ((archiveFlags & kFlagXboxArchive) != 0 || (archiveFlags & kFlagXMemCodec) != 0)
+        {
+            FLOAR_LOG_WARN("[BSA] Xbox/XMem BSA archives are not supported.");
+            return;
+        }
+
+        if (folderOffset != kHeaderSize)
+        {
+            FLOAR_LOG_WARN("[BSA] Unexpected folder record offset {}.", folderOffset);
+            // Continue anyway; some tools tolerate this.
+        }
+
+        m_version = version;
+        m_archiveFlags = archiveFlags;
+        m_formatName = L"BSA v" + std::to_wstring(version);
+
+        struct FolderRecord
+        {
+            uint64_t nameHash = 0;
+            uint32_t count = 0;
+            uint32_t offset = 0;
+        };
+
+        std::vector<FolderRecord> folders;
+        folders.reserve(folderCount);
+        for (uint32_t i = 0; i < folderCount; ++i)
+        {
+            FolderRecord folder {};
+            if (!ReadValue(stream, folder.nameHash) || !ReadValue(stream, folder.count))
+            {
+                FLOAR_LOG_WARN("[BSA] Failed to read folder record.");
+                return;
+            }
+
+            if (version >= 105)
+            {
+                uint32_t pad = 0;
+                if (!ReadValue(stream, pad))
+                {
+                    FLOAR_LOG_WARN("[BSA] Failed to read v105 folder padding.");
+                    return;
+                }
+            }
+
+            if (!ReadValue(stream, folder.offset))
+            {
+                FLOAR_LOG_WARN("[BSA] Failed to read folder offset.");
+                return;
+            }
+
+            if (version >= 105)
+            {
+                uint32_t pad = 0;
+                if (!ReadValue(stream, pad))
+                {
+                    FLOAR_LOG_WARN("[BSA] Failed to read v105 folder offset padding.");
+                    return;
+                }
+            }
+
+            folders.push_back(folder);
+        }
+
+        const bool includeDirNames = (archiveFlags & kFlagIncludeDirectoryNames) != 0;
+        const bool includeFileNames = (archiveFlags & kFlagIncludeFileNames) != 0;
+
+        struct PendingFile
+        {
+            uint64_t nameHash = 0;
+            uint32_t sizeField = 0;
+            uint32_t offset = 0;
+            std::wstring folderPath;
+        };
+        std::vector<PendingFile> pending;
+        pending.reserve(fileCount);
+
+        for (const FolderRecord& folder : folders)
+        {
+            const uint64_t recordsOffset =
+                static_cast<uint64_t>(folder.offset) - static_cast<uint64_t>(totalFileNameLength);
+            stream.seekg(static_cast<std::streamoff>(recordsOffset), std::ios::beg);
+            if (!stream.good())
+            {
+                FLOAR_LOG_WARN("[BSA] Seek to folder file records failed.");
+                return;
+            }
+
+            std::wstring folderPath;
+            if (includeDirNames)
+            {
+                std::string folderName;
+                if (!ReadBzString(stream, folderName))
+                {
+                    FLOAR_LOG_WARN("[BSA] Failed to read folder name.");
+                    return;
+                }
+                folderPath = Utf8ToWide(folderName.data(), folderName.size());
+                folderPath = NormalizeArchivePath(folderPath);
+                while (!folderPath.empty() && (folderPath.back() == L'/' || folderPath.back() == L'\\'))
+                {
+                    folderPath.pop_back();
+                }
+            }
+
+            for (uint32_t fi = 0; fi < folder.count; ++fi)
+            {
+                PendingFile file {};
+                if (!ReadValue(stream, file.nameHash) ||
+                    !ReadValue(stream, file.sizeField) ||
+                    !ReadValue(stream, file.offset))
+                {
+                    FLOAR_LOG_WARN("[BSA] Failed to read file record.");
+                    return;
+                }
+                file.folderPath = folderPath;
+                pending.push_back(file);
+            }
+        }
+
+        std::vector<std::wstring> fileNames;
+        fileNames.reserve(fileCount);
+        if (includeFileNames && totalFileNameLength > 0)
+        {
+            std::string nameBlob(static_cast<size_t>(totalFileNameLength), '\0');
+            if (!ReadBytes(stream, nameBlob.data(), nameBlob.size()))
+            {
+                FLOAR_LOG_WARN("[BSA] Failed to read file name block.");
+                return;
+            }
+
+            size_t pos = 0;
+            while (pos < nameBlob.size() && fileNames.size() < pending.size())
+            {
+                const size_t end = nameBlob.find('\0', pos);
+                if (end == std::string::npos)
+                {
+                    fileNames.push_back(Utf8ToWide(nameBlob.data() + pos, nameBlob.size() - pos));
+                    break;
+                }
+                fileNames.push_back(Utf8ToWide(nameBlob.data() + pos, end - pos));
+                pos = end + 1;
+            }
+        }
+
+        m_files.reserve(pending.size());
+        m_entries.reserve(pending.size());
+        for (size_t i = 0; i < pending.size(); ++i)
+        {
+            const PendingFile& src = pending[i];
+            BsaFileInfo info {};
+            info.offset = src.offset;
+            info.rawSizeField = src.sizeField;
+
+            const bool flip = (src.sizeField & kSizeCompressionFlip) != 0;
+            info.reportedSize = src.sizeField & ~kSizeCompressionFlip;
+            info.compressed = DefaultCompressed() ^ flip;
+
+            std::wstring fileName;
+            if (i < fileNames.size() && !fileNames[i].empty())
+            {
+                fileName = fileNames[i];
+            }
+            else
+            {
+                fileName = L"file_" + std::to_wstring(i);
+            }
+
+            if (!src.folderPath.empty())
+            {
+                info.name = NormalizeArchivePath(src.folderPath + L"/" + fileName);
+            }
+            else
+            {
+                info.name = NormalizeArchivePath(fileName);
+            }
+
+            ArchiveEntry entry {};
+            entry.name = info.name;
+            entry.size = info.compressed ? 0 : info.reportedSize;
+            entry.compressedSize = info.compressed ? info.reportedSize : 0;
+            entry.isDirectory = false;
+            entry.modTime = 0;
+
+            m_entryMap[Floar::StringUtil::ToLower(info.name)] = m_files.size();
+            m_files.push_back(info);
+            m_entries.push_back(entry);
+        }
+
+        FLOAR_LOG_INFO("[BSA] Opened {} (version {}, {} entries).",
+            m_path.string(), m_version, m_entries.size());
+    }
+};
+
 #if FLOAR_ENABLE_COMMON_ARCHIVES
 class LibArchiveReader : public IArchiveReader
 {
@@ -1117,6 +1569,15 @@ std::unique_ptr<IArchiveReader> ArchiveReaderFactory::Open(const std::filesystem
         if (ext == L".ba2")
         {
             auto reader = std::make_unique<Ba2Reader>(path);
+            if (reader->ListEntries().empty())
+            {
+                return nullptr;
+            }
+            return reader;
+        }
+        if (ext == L".bsa")
+        {
+            auto reader = std::make_unique<BsaReader>(path);
             if (reader->ListEntries().empty())
             {
                 return nullptr;
