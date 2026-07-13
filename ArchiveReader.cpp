@@ -305,6 +305,111 @@ namespace
         return {};
     }
 
+    // Skyrim SE v105 BSAs store their compressed payloads in the LZ4 FRAME
+    // format (magic 0x184D2204: frame descriptor + a sequence of independent
+    // or linked data blocks), not as a single raw LZ4 block. lz4frame.c is
+    // not vendored, but the frame layout is simple enough to walk by hand
+    // and decode block-wise with the block API.
+    std::vector<uint8_t> DecompressLz4Frame(
+        const std::vector<uint8_t>& compressed,
+        uint32_t expectedSize)
+    {
+        const uint8_t* src = compressed.data();
+        const size_t srcSize = compressed.size();
+        size_t pos = 4; // past the magic checked by the caller
+
+        auto readU32 = [&](uint32_t& v) -> bool
+        {
+            if (pos + 4 > srcSize)
+                return false;
+            v = static_cast<uint32_t>(src[pos]) | (static_cast<uint32_t>(src[pos + 1]) << 8)
+                | (static_cast<uint32_t>(src[pos + 2]) << 16) | (static_cast<uint32_t>(src[pos + 3]) << 24);
+            pos += 4;
+            return true;
+        };
+
+        if (pos + 3 > srcSize)
+            return {};
+        const uint8_t flg = src[pos++];
+        pos++; // BD byte (max block size) - block sizes are validated per-block below
+        if ((flg >> 6) != 0x1)
+        {
+            FLOAR_LOG_WARN("[BSA] LZ4 frame: unsupported version.");
+            return {};
+        }
+        const bool blockIndep = (flg & 0x20) != 0;
+        const bool blockChecksum = (flg & 0x10) != 0;
+        if ((flg & 0x08) != 0) pos += 8;  // Content Size field
+        if ((flg & 0x01) != 0) pos += 4;  // Dictionary ID field
+        pos += 1;                         // header checksum byte
+
+        std::vector<uint8_t> output(expectedSize);
+        size_t outPos = 0;
+        for (;;)
+        {
+            uint32_t blockSize = 0;
+            if (!readU32(blockSize))
+            {
+                FLOAR_LOG_WARN("[BSA] LZ4 frame: truncated block header.");
+                return {};
+            }
+            if (blockSize == 0) // EndMark
+                break;
+            const bool storedUncompressed = (blockSize & 0x80000000u) != 0;
+            blockSize &= 0x7FFFFFFFu;
+            if (pos + blockSize > srcSize)
+            {
+                FLOAR_LOG_WARN("[BSA] LZ4 frame: block overruns payload.");
+                return {};
+            }
+            if (storedUncompressed)
+            {
+                if (outPos + blockSize > output.size())
+                {
+                    FLOAR_LOG_WARN("[BSA] LZ4 frame: output overflow.");
+                    return {};
+                }
+                std::memcpy(output.data() + outPos, src + pos, blockSize);
+                outPos += blockSize;
+            }
+            else
+            {
+                const int capacity = static_cast<int>(output.size() - outPos);
+                int decoded;
+                if (blockIndep || outPos == 0)
+                {
+                    decoded = LZ4_decompress_safe(
+                        reinterpret_cast<const char*>(src + pos),
+                        reinterpret_cast<char*>(output.data() + outPos),
+                        static_cast<int>(blockSize), capacity);
+                }
+                else
+                {
+                    // Linked blocks: previous output doubles as dictionary
+                    // (the block API uses at most the trailing 64 KiB).
+                    decoded = LZ4_decompress_safe_usingDict(
+                        reinterpret_cast<const char*>(src + pos),
+                        reinterpret_cast<char*>(output.data() + outPos),
+                        static_cast<int>(blockSize), capacity,
+                        reinterpret_cast<const char*>(output.data()),
+                        static_cast<int>(outPos));
+                }
+                if (decoded < 0)
+                {
+                    FLOAR_LOG_WARN("[BSA] LZ4 frame: block decode failed.");
+                    return {};
+                }
+                outPos += static_cast<size_t>(decoded);
+            }
+            pos += blockSize;
+            if (blockChecksum)
+                pos += 4;
+        }
+
+        output.resize(outPos);
+        return output;
+    }
+
     std::vector<uint8_t> DecompressLz4(
         const std::vector<uint8_t>& compressed,
         uint32_t expectedSize)
@@ -316,6 +421,16 @@ namespace
             return output;
         }
 
+        constexpr uint32_t kLz4FrameMagic = 0x184D2204u;
+        if (compressed.size() >= 4)
+        {
+            const uint32_t magic = static_cast<uint32_t>(compressed[0]) | (static_cast<uint32_t>(compressed[1]) << 8)
+                | (static_cast<uint32_t>(compressed[2]) << 16) | (static_cast<uint32_t>(compressed[3]) << 24);
+            if (magic == kLz4FrameMagic)
+                return DecompressLz4Frame(compressed, expectedSize);
+        }
+
+        // Not a frame: treat as one raw LZ4 block.
         output.resize(expectedSize);
         const int decoded = LZ4_decompress_safe(
             reinterpret_cast<const char*>(compressed.data()),
@@ -1006,14 +1121,19 @@ private:
         uint32_t remaining = info.reportedSize;
         if (EmbedFileNames())
         {
+            // The embedded name is a bstring (1 length byte + N chars, NO
+            // trailing NUL - verified against Skyrim SE's own archives), so
+            // account for exactly the bytes consumed off the stream rather
+            // than assuming a bzstring's extra terminator; overcounting by 1
+            // truncated the tail byte of every compressed payload.
+            const std::streamoff nameStart = stream.tellg();
             std::string embedded;
             if (!ReadBzString(stream, embedded))
             {
                 FLOAR_LOG_WARN("[BSA] Failed to skip embedded file name.");
                 return {};
             }
-            // bzstring on disk: 1 length byte + N bytes where N includes trailing NUL.
-            const uint32_t onDiskNameBytes = static_cast<uint32_t>(embedded.size()) + 2u;
+            const uint32_t onDiskNameBytes = static_cast<uint32_t>(stream.tellg() - nameStart);
             if (remaining < onDiskNameBytes)
             {
                 FLOAR_LOG_WARN("[BSA] Embedded name larger than file size field.");
