@@ -4,6 +4,10 @@
 #include "FloarLog.h"
 #include <algorithm>
 #include <fstream>
+#include <memory>
+#include <mutex>
+#include <system_error>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Floar
@@ -17,6 +21,54 @@ namespace
             return false;
         }
         return str.compare(0, prefix.length(), prefix) == 0;
+    }
+
+    // Archive-reader cache. Opening a reader parses the whole file table
+    // (Ba2Reader/BsaReader::ScanArchive), so re-Opening the same archive for
+    // every ListDirectory/ReadFile/IsDirectory call - e.g. once per thumbnail
+    // while browsing a BSA/BA2 - is O(entries) wasted work per call and starves
+    // the UI + load pool. A scanned reader is read-only (ExtractToMemory opens
+    // its own local file handle each call; ListEntries/HasEntry only read const
+    // tables), so one cached reader is safe to share across threads. Keyed by
+    // lower-cased path + last-write-time so an archive rebuilt on disk re-scans.
+    std::mutex g_readerMutex;
+    struct CachedReader
+    {
+        std::shared_ptr<IArchiveReader> reader;
+        std::filesystem::file_time_type mtime {};
+    };
+    std::unordered_map<std::wstring, CachedReader> g_readerCache;
+    constexpr size_t kMaxCachedReaders = 16; // browsing touches only a few at once
+
+    std::shared_ptr<IArchiveReader> GetCachedReader(const std::filesystem::path& archivePath)
+    {
+        std::error_code ec;
+        const auto mtime = std::filesystem::last_write_time(archivePath, ec);
+        const std::wstring key = StringUtil::ToLower(archivePath.wstring());
+
+        std::lock_guard<std::mutex> lk(g_readerMutex);
+        if (auto it = g_readerCache.find(key); it != g_readerCache.end())
+        {
+            // Reuse unless the file changed on disk. If the mtime is unavailable
+            // (ec), trust the cached reader for the session.
+            if (ec || it->second.mtime == mtime)
+            {
+                return it->second.reader;
+            }
+        }
+
+        std::shared_ptr<IArchiveReader> reader = ArchiveReaderFactory::Open(archivePath);
+        if (reader)
+        {
+            // Bound the cache: readers hold only file-table metadata (not file
+            // contents), but don't let a long browsing session grow unbounded.
+            if (g_readerCache.size() >= kMaxCachedReaders && g_readerCache.find(key) == g_readerCache.end())
+            {
+                g_readerCache.clear();
+            }
+            g_readerCache[key] = CachedReader{ reader, ec ? std::filesystem::file_time_type{} : mtime };
+        }
+        return reader;
     }
 }
 
@@ -40,7 +92,7 @@ std::vector<uint8_t> VirtualFileSystem::ReadFile(const VirtualPath& filePath)
 {
     if (filePath.IsInArchive())
     {
-        auto reader = ArchiveReaderFactory::Open(filePath.hostPath);
+        auto reader = GetCachedReader(filePath.hostPath);
         if (!reader)
         {
             FLOAR_LOG_WARN("[VFS] Failed to open archive reader.");
@@ -79,7 +131,7 @@ bool VirtualFileSystem::IsDirectory(const VirtualPath& path)
 {
     if (path.IsInArchive())
     {
-        auto reader = ArchiveReaderFactory::Open(path.hostPath);
+        auto reader = GetCachedReader(path.hostPath);
         if (!reader)
         {
             return false;
@@ -167,7 +219,7 @@ std::vector<VirtualFileEntry> VirtualFileSystem::ListFilesystemDirectory(const s
 std::vector<VirtualFileEntry> VirtualFileSystem::ListArchiveRoot(const std::filesystem::path& archivePath)
 {
     std::vector<VirtualFileEntry> entries;
-    auto reader = ArchiveReaderFactory::Open(archivePath);
+    auto reader = GetCachedReader(archivePath);
     if (!reader)
     {
         return entries;
@@ -203,7 +255,7 @@ std::vector<VirtualFileEntry> VirtualFileSystem::ListArchiveSubdirectory(
     const std::wstring& innerPath)
 {
     std::vector<VirtualFileEntry> entries;
-    auto reader = ArchiveReaderFactory::Open(archivePath);
+    auto reader = GetCachedReader(archivePath);
     if (!reader)
     {
         return entries;
