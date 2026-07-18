@@ -30,6 +30,7 @@ class VirtualFileSystem
 public:
     static std::vector<VirtualFileEntry> ListDirectory(const VirtualPath& dirPath);
     static std::vector<uint8_t> ReadFile(const VirtualPath& filePath);
+    static bool Exists(const VirtualPath& path);
     static bool IsDirectory(const VirtualPath& path);
 
     static void EnumerateFilesystemDirectory(

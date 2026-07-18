@@ -127,6 +127,29 @@ std::vector<uint8_t> VirtualFileSystem::ReadFile(const VirtualPath& filePath)
     }
 }
 
+bool VirtualFileSystem::Exists(const VirtualPath& path)
+{
+    if (path.IsInArchive())
+    {
+        auto reader = GetCachedReader(path.hostPath);
+        if (!reader)
+        {
+            return false;
+        }
+        if (reader->HasEntry(path.archiveInnerPath))
+        {
+            return true;
+        }
+
+        // Some archive formats omit explicit directory entries. Treat a path
+        // as existing when at least one entry has it as a parent directory.
+        return IsDirectory(path);
+    }
+
+    std::error_code ec;
+    return std::filesystem::exists(path.hostPath, ec) && !ec;
+}
+
 bool VirtualFileSystem::IsDirectory(const VirtualPath& path)
 {
     if (path.IsInArchive())
