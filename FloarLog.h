@@ -35,6 +35,10 @@ namespace Log
     {
         return text ? ToUtf8(std::wstring_view(text)) : std::string();
     }
+    // Non-throwing conversion of narrow text in `codePage` (for example a
+    // library diagnostic) to UTF-8. Bytes that do not decode become U+FFFD (or
+    // '?' if the code page is unavailable), so the result is always valid UTF-8.
+    std::string CodePageToUtf8(std::string_view text, unsigned codePage) noexcept;
 
     namespace Detail
     {

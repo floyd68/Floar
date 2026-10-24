@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <array>
+#include <clocale>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -99,6 +101,49 @@ namespace
         WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, result.data(), utf8Len, nullptr, nullptr);
         return result;
     }
+
+#if FLOAR_ENABLE_COMMON_ARCHIVES
+    // Code page libarchive uses for its narrow diagnostics (including %ls
+    // paths). Mirrors get_current_codepage() in archive_string.c: the "C"
+    // locale stores each UTF-16 unit <= 0xFF as one byte (Latin-1) and '?'
+    // otherwise; ".utf8"/".UTF-8" is UTF-8; ".NNN" is code page NNN; anything
+    // else is the ANSI code page.
+    unsigned LibArchiveDiagnosticCodePage()
+    {
+        constexpr unsigned kLatin1 = 28591;
+        const char* locale = setlocale(LC_CTYPE, nullptr);
+        if (!locale)
+        {
+            return GetACP();
+        }
+        if (locale[0] == 'C' && locale[1] == '\0')
+        {
+            return kLatin1;
+        }
+        const char* dot = std::strrchr(locale, '.');
+        if (!dot)
+        {
+            return GetACP();
+        }
+        if (std::strcmp(dot + 1, "utf8") == 0 || std::strcmp(dot + 1, "UTF-8") == 0)
+        {
+            return CP_UTF8;
+        }
+        const int codePage = std::atoi(dot + 1);
+        return codePage > 0 ? static_cast<unsigned>(codePage) : GetACP();
+    }
+
+    // archive_error_string() as UTF-8 for the log sink.
+    std::string ArchiveErrorUtf8(struct archive* a)
+    {
+        const char* message = archive_error_string(a);
+        if (!message)
+        {
+            return "Unknown error";
+        }
+        return Log::CodePageToUtf8(message, LibArchiveDiagnosticCodePage());
+    }
+#endif
 
     template <typename T>
     bool ReadValue(std::ifstream& stream, T& outValue)
@@ -1507,7 +1552,8 @@ public:
 
         while (archive_read_next_header(a, &archiveEntry) == ARCHIVE_OK)
         {
-            const char* name = archive_entry_pathname(archiveEntry);
+            // UTF-8 view, independent of the CRT locale (see ScanArchive).
+            const char* name = archive_entry_pathname_utf8(archiveEntry);
             if (!name)
                 continue;
 
@@ -1617,9 +1663,8 @@ private:
         int r = archive_read_open_filename_w(a, m_path.c_str(), 10240);
         if (r != ARCHIVE_OK)
         {
-            const char* errMsg = archive_error_string(a);
             FLOAR_LOG_ERROR("[LibArchiveReader] ERROR: Failed to open {}: {}",
-                Log::ToUtf8(m_path), errMsg ? errMsg : "Unknown error");
+                Log::ToUtf8(m_path), ArchiveErrorUtf8(a));
             archive_read_free(a);
             return;
         }
@@ -1641,12 +1686,13 @@ private:
             }
             if (r != ARCHIVE_OK)
             {
-                const char* errMsg = archive_error_string(a);
-                FLOAR_LOG_ERROR("[LibArchiveReader] ERROR reading header: {}", errMsg ? errMsg : "Unknown error");
+                FLOAR_LOG_ERROR("[LibArchiveReader] ERROR reading header: {}", ArchiveErrorUtf8(a));
                 break;
             }
 
-            const char* name = archive_entry_pathname(entry);
+            // archive_entry_pathname() is in the CRT locale's code page (Latin-1
+            // or '?' in the "C" locale); the UTF-8 view keeps every name intact.
+            const char* name = archive_entry_pathname_utf8(entry);
             if (!name)
             {
                 continue;

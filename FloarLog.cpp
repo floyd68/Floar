@@ -51,6 +51,57 @@ namespace Log
         return ToUtf8(std::wstring_view(path.native()));
     }
 
+    std::string CodePageToUtf8(std::string_view text, unsigned codePage) noexcept
+    {
+        bool ascii = true;
+        for (const char c : text)
+        {
+            if (static_cast<unsigned char>(c) >= 0x80)
+            {
+                ascii = false;
+                break;
+            }
+        }
+        if (ascii)
+        {
+            try
+            {
+                return std::string(text);
+            }
+            catch (...)
+            {
+                return {};
+            }
+        }
+
+        try
+        {
+            const int length = static_cast<int>(text.size());
+            const int chars = MultiByteToWideChar(codePage, 0, text.data(), length, nullptr, 0);
+            if (chars > 0)
+            {
+                std::wstring wide(static_cast<size_t>(chars), L'\0');
+                MultiByteToWideChar(codePage, 0, text.data(), length, wide.data(), chars);
+                return ToUtf8(std::wstring_view(wide));
+            }
+
+            // Code page not installed: keep ASCII and mark everything else.
+            std::string out(text);
+            for (char& c : out)
+            {
+                if (static_cast<unsigned char>(c) >= 0x80)
+                {
+                    c = '?';
+                }
+            }
+            return out;
+        }
+        catch (...)
+        {
+            return {};
+        }
+    }
+
     namespace Detail
     {
         bool HasSink() noexcept
