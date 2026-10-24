@@ -3,6 +3,16 @@ cmake_minimum_required(VERSION 3.21)
 project(Floar LANGUAGES C CXX)
 
 option(FLOAR_ENABLE_COMMON_ARCHIVES "Enable ZIP/7z/RAR via libarchive" ON)
+option(FLOAR_BUILD_TESTS "Build Floar first-party unit tests (vendored dependency tests stay off)" OFF)
+
+if(PROJECT_IS_TOP_LEVEL)
+    # Standalone build: keep the vendored zlib/xz/libarchive suites off. Inside
+    # FICture2 the parent project already forces this.
+    set(BUILD_TESTING OFF CACHE BOOL "Disable vendored dependency tests" FORCE)
+    if(FLOAR_BUILD_TESTS)
+        enable_testing()
+    endif()
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -174,4 +184,8 @@ endif()
 
 if(MSVC)
     target_compile_options(Floar PRIVATE /permissive-)
+endif()
+
+if(FLOAR_BUILD_TESTS)
+    add_subdirectory(tests)
 endif()
