@@ -1427,7 +1427,7 @@ private:
         }
 
         FLOAR_LOG_INFO("[BSA] Opened {} (version {}, {} entries).",
-            m_path.string(), m_version, m_entries.size());
+            Log::ToUtf8(m_path), m_version, m_entries.size());
     }
 };
 
@@ -1443,7 +1443,7 @@ public:
     LibArchiveReader(const std::filesystem::path& path)
         : m_path(path)
     {
-        FLOAR_LOG_INFO("[LibArchiveReader] Opening: {}", path.string());
+        FLOAR_LOG_INFO("[LibArchiveReader] Opening: {}", Log::ToUtf8(path));
         ScanArchive();
         FLOAR_LOG_INFO("[LibArchiveReader] Scanned, found {} entries", m_entries.size());
     }
@@ -1455,7 +1455,7 @@ public:
 
     std::vector<uint8_t> ExtractToMemory(const std::wstring& entryPath) override
     {
-        FLOAR_LOG_DEBUG("[LibArchiveReader] ExtractToMemory: {}", std::filesystem::path(entryPath).string());
+        FLOAR_LOG_DEBUG("[LibArchiveReader] ExtractToMemory: {}", Log::ToUtf8(entryPath));
 
         auto it = m_entryMap.find(Floar::StringUtil::ToLower(NormalizeArchivePath(entryPath)));
         if (it == m_entryMap.end())
@@ -1491,8 +1491,9 @@ public:
         archive_read_support_filter_xz(a);      // 7z XZ
 #endif
 
-        std::string pathUtf8 = WideToUtf8(m_path.wstring());
-        int r = archive_read_open_filename(a, pathUtf8.c_str(), 10240);
+        // Wide open: libarchive reads a narrow path in the active code page on
+        // Windows, which cannot name files outside it.
+        int r = archive_read_open_filename_w(a, m_path.c_str(), 10240);
         if (r != ARCHIVE_OK)
         {
             archive_read_free(a);
@@ -1611,13 +1612,14 @@ private:
         archive_read_support_filter_xz(a);      // 7z XZ
 #endif
 
-        std::string pathUtf8 = WideToUtf8(m_path.wstring());
-        int r = archive_read_open_filename(a, pathUtf8.c_str(), 10240);
+        // Wide open: libarchive reads a narrow path in the active code page on
+        // Windows, which cannot name files outside it.
+        int r = archive_read_open_filename_w(a, m_path.c_str(), 10240);
         if (r != ARCHIVE_OK)
         {
             const char* errMsg = archive_error_string(a);
-            std::wstring errWide = errMsg ? Utf8ToWide(errMsg) : L"Unknown error";
-            FLOAR_LOG_ERROR("[LibArchiveReader] ERROR: Failed to open {}: {}", m_path.string(), std::filesystem::path(errWide).string());
+            FLOAR_LOG_ERROR("[LibArchiveReader] ERROR: Failed to open {}: {}",
+                Log::ToUtf8(m_path), errMsg ? errMsg : "Unknown error");
             archive_read_free(a);
             return;
         }
@@ -1640,8 +1642,7 @@ private:
             if (r != ARCHIVE_OK)
             {
                 const char* errMsg = archive_error_string(a);
-                std::wstring errWide = errMsg ? Utf8ToWide(errMsg) : L"Unknown error";
-                FLOAR_LOG_ERROR("[LibArchiveReader] ERROR reading header: {}", std::filesystem::path(errWide).string());
+                FLOAR_LOG_ERROR("[LibArchiveReader] ERROR reading header: {}", errMsg ? errMsg : "Unknown error");
                 break;
             }
 

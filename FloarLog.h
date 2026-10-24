@@ -1,12 +1,19 @@
 #pragma once
 
 // FloarLog.h - optional sink-based logging for Floar internals.
-// With no sink installed, every FLOAR_LOG_* call is a silent no-op.
+// With no sink installed, every FLOAR_LOG_* call is a silent no-op: the
+// arguments are not evaluated and nothing is formatted.
 // Host apps (e.g. FICture2) call Floar::Log::SetSink() once at startup.
+// Messages are UTF-8. Pass paths and other wide strings through Log::ToUtf8
+// (never std::filesystem::path::string(), which uses the active code page and
+// throws for characters outside it). A logging failure (formatting, conversion,
+// or a throwing sink) is swallowed so it can never escape an archive operation.
 
 #include <chrono>
+#include <filesystem>
 #include <sstream>
 #include <string>
+#include <string_view>
 
 namespace Floar
 {
@@ -18,8 +25,20 @@ namespace Log
 
     void SetSink(Sink sink);
 
+    // Non-throwing UTF-16 -> UTF-8 conversion. Unpaired surrogates become U+FFFD.
+    std::string ToUtf8(std::wstring_view text) noexcept;
+    std::string ToUtf8(const std::filesystem::path& path) noexcept;
+    // Exact-match overloads: std::wstring and wide literals convert to both
+    // std::wstring_view and std::filesystem::path, which would be ambiguous.
+    inline std::string ToUtf8(const std::wstring& text) noexcept { return ToUtf8(std::wstring_view(text)); }
+    inline std::string ToUtf8(const wchar_t* text) noexcept
+    {
+        return text ? ToUtf8(std::wstring_view(text)) : std::string();
+    }
+
     namespace Detail
     {
+        bool HasSink() noexcept;
         void Dispatch(Level level, std::string message);
 
         template <typename T>
@@ -58,13 +77,28 @@ namespace Log
 }
 }
 
-#define FLOAR_LOG_INFO(...)   ::Floar::Log::Detail::Dispatch(::Floar::Log::Level::Info,  ::Floar::Log::Detail::Format(__VA_ARGS__))
-#define FLOAR_LOG_WARN(...)   ::Floar::Log::Detail::Dispatch(::Floar::Log::Level::Warn,  ::Floar::Log::Detail::Format(__VA_ARGS__))
-#define FLOAR_LOG_ERROR(...)  ::Floar::Log::Detail::Dispatch(::Floar::Log::Level::Error, ::Floar::Log::Detail::Format(__VA_ARGS__))
+// Arguments are evaluated and formatted only when a sink is installed.
+#define FLOAR_LOG_AT(level, ...) \
+    do { \
+        if (::Floar::Log::Detail::HasSink()) \
+        { \
+            try \
+            { \
+                ::Floar::Log::Detail::Dispatch((level), ::Floar::Log::Detail::Format(__VA_ARGS__)); \
+            } \
+            catch (...) \
+            { \
+            } \
+        } \
+    } while (0)
+
+#define FLOAR_LOG_INFO(...)   FLOAR_LOG_AT(::Floar::Log::Level::Info,  __VA_ARGS__)
+#define FLOAR_LOG_WARN(...)   FLOAR_LOG_AT(::Floar::Log::Level::Warn,  __VA_ARGS__)
+#define FLOAR_LOG_ERROR(...)  FLOAR_LOG_AT(::Floar::Log::Level::Error, __VA_ARGS__)
 
 #ifdef _DEBUG
-#define FLOAR_LOG_TRACE(...)  ::Floar::Log::Detail::Dispatch(::Floar::Log::Level::Trace, ::Floar::Log::Detail::Format(__VA_ARGS__))
-#define FLOAR_LOG_DEBUG(...)  ::Floar::Log::Detail::Dispatch(::Floar::Log::Level::Debug, ::Floar::Log::Detail::Format(__VA_ARGS__))
+#define FLOAR_LOG_TRACE(...)  FLOAR_LOG_AT(::Floar::Log::Level::Trace, __VA_ARGS__)
+#define FLOAR_LOG_DEBUG(...)  FLOAR_LOG_AT(::Floar::Log::Level::Debug, __VA_ARGS__)
 #else
 #define FLOAR_LOG_TRACE(...)  do {} while (0)
 #define FLOAR_LOG_DEBUG(...)  do {} while (0)
