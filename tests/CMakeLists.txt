@@ -3,14 +3,20 @@
 # or as part of the FICture2 tree. Vendored zlib/xz/libarchive tests stay off.
 
 add_executable(FloarTests
+    TestArchives.h
     TestHarness.h
     TestMain.cpp
+    Ba2Tests.cpp
     LogTests.cpp
+    StreamingTests.cpp
     VfsTests.cpp
 )
 
 target_include_directories(FloarTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    # zlib builds the BA2 fixtures' compressed chunks.
+    ${PROJECT_SOURCE_DIR}/external/zlib
+    ${PROJECT_BINARY_DIR}/external/zlib
 )
 
 target_compile_definitions(FloarTests PRIVATE
@@ -20,6 +26,7 @@ target_compile_definitions(FloarTests PRIVATE
 
 target_link_libraries(FloarTests PRIVATE
     Floar
+    zlibstatic
 )
 
 if(FLOAR_ENABLE_COMMON_ARCHIVES)
@@ -36,5 +43,7 @@ endif()
 
 add_test(NAME Floar.Log COMMAND FloarTests Log_)
 add_test(NAME Floar.Vfs COMMAND FloarTests Vfs)
+add_test(NAME Floar.Ba2 COMMAND FloarTests Ba2_)
+add_test(NAME Floar.Streaming COMMAND FloarTests Stream)
 # Safety net only: the tests contain no unbounded waits.
-set_tests_properties(Floar.Log Floar.Vfs PROPERTIES TIMEOUT 120)
+set_tests_properties(Floar.Log Floar.Vfs Floar.Ba2 Floar.Streaming PROPERTIES TIMEOUT 120)

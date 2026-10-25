@@ -21,10 +21,7 @@
 #include <unordered_set>
 #include <vector>
 
-#if FLOAR_ENABLE_COMMON_ARCHIVES
-#include "archive.h"
-#include "archive_entry.h"
-#endif
+#include "TestArchives.h"
 
 // Path policy (normalization, equality, hashing), the extension check before
 // any status query, and the archive-reader cache: reuse across equivalent
@@ -66,7 +63,7 @@ namespace
 
     ArchiveReaderCache::Opener FakeOpener()
     {
-        return [](const std::filesystem::path&) { return std::make_shared<FakeReader>(); };
+        return [](const std::filesystem::path&, std::stop_token) { return std::make_shared<FakeReader>(); };
     }
 }
 
@@ -217,7 +214,7 @@ FLOAR_TEST(VfsCache_FailedOpenIsNotCached)
     const std::filesystem::path dir = TempDir(L"failed");
     const auto file = dir / L"broken.zip";
     WriteText(file, "not an archive");
-    ArchiveReaderCache cache(4, [](const std::filesystem::path&) { return std::shared_ptr<IArchiveReader>(); });
+    ArchiveReaderCache cache(4, [](const std::filesystem::path&, std::stop_token) { return std::shared_ptr<IArchiveReader>(); });
     FLOAR_CHECK(cache.Get(file) == nullptr);
     FLOAR_CHECK(cache.Size() == 0);
     FLOAR_CHECK(cache.Get(file) == nullptr);
@@ -242,7 +239,7 @@ FLOAR_TEST(VfsCache_SlowOpenDoesNotBlockOtherArchives)
     bool slowEntered = false;
     bool releaseSlow = false;
     std::atomic<int> slowOpens { 0 };
-    ArchiveReaderCache cache(8, [&](const std::filesystem::path& path) -> std::shared_ptr<IArchiveReader>
+    ArchiveReaderCache cache(8, [&](const std::filesystem::path& path, std::stop_token) -> std::shared_ptr<IArchiveReader>
     {
         if (path.filename() == L"slow.zip")
         {
@@ -306,7 +303,7 @@ FLOAR_TEST(VfsCache_EvictionNeverSplitsAnOpenInProgress)
     bool aEntered = false;
     bool releaseA = false;
     std::atomic<int> aOpens { 0 };
-    ArchiveReaderCache cache(1, [&](const std::filesystem::path& path) -> std::shared_ptr<IArchiveReader>
+    ArchiveReaderCache cache(1, [&](const std::filesystem::path& path, std::stop_token) -> std::shared_ptr<IArchiveReader>
     {
         if (path.filename() == L"a.zip")
         {
@@ -388,7 +385,7 @@ FLOAR_TEST(VfsCache_OpensTheAbsolutePathItIsKeyedBy)
     std::filesystem::create_directories(dirB);
     WriteText(dirA / L"pack.zip", "a");
     WriteText(dirB / L"pack.zip", "bb");
-    ArchiveReaderCache cache(4, [](const std::filesystem::path& path)
+    ArchiveReaderCache cache(4, [](const std::filesystem::path& path, std::stop_token)
     {
         return std::make_shared<PathReader>(path);
     });
@@ -421,58 +418,11 @@ FLOAR_TEST(VfsCache_OpensTheAbsolutePathItIsKeyedBy)
 #if FLOAR_ENABLE_COMMON_ARCHIVES
 namespace
 {
-    // Writes a ZIP with the given files (name -> data) and explicit directory entries.
-    bool WriteZip(
-        const std::filesystem::path& path,
-        const std::vector<std::pair<std::wstring, std::string>>& files,
-        const std::vector<std::wstring>& directories)
-    {
-        struct archive* a = archive_write_new();
-        if (!a)
-        {
-            return false;
-        }
-        bool ok = archive_write_set_format_zip(a) == ARCHIVE_OK &&
-            archive_write_set_options(a, "zip:hdrcharset=UTF-8") == ARCHIVE_OK &&
-            archive_write_open_filename_w(a, path.c_str()) == ARCHIVE_OK;
-        for (const auto& name : directories)
-        {
-            if (!ok)
-            {
-                break;
-            }
-            struct archive_entry* entry = archive_entry_new();
-            archive_entry_set_pathname_utf8(entry, Log::ToUtf8(name).c_str());
-            archive_entry_set_filetype(entry, AE_IFDIR);
-            archive_entry_set_perm(entry, 0755);
-            ok = archive_write_header(a, entry) == ARCHIVE_OK;
-            archive_entry_free(entry);
-        }
-        for (const auto& [name, data] : files)
-        {
-            if (!ok)
-            {
-                break;
-            }
-            struct archive_entry* entry = archive_entry_new();
-            archive_entry_set_pathname_utf8(entry, Log::ToUtf8(name).c_str());
-            archive_entry_set_size(entry, static_cast<la_int64_t>(data.size()));
-            archive_entry_set_filetype(entry, AE_IFREG);
-            archive_entry_set_perm(entry, 0644);
-            ok = archive_write_header(a, entry) == ARCHIVE_OK &&
-                archive_write_data(a, data.data(), data.size()) == static_cast<la_ssize_t>(data.size());
-            archive_entry_free(entry);
-        }
-        ok = (archive_write_close(a) == ARCHIVE_OK) && ok;
-        archive_write_free(a);
-        return ok;
-    }
-
     struct FixtureArchive
     {
         std::filesystem::path dir = TempDir(L"zip");
         std::filesystem::path path = dir / L"Fixture.zip";
-        bool written = WriteZip(path,
+        bool written = FloarTest::WriteZip(path,
             { { L"Folder/Sub/a.txt", "a" }, { L"Folder/b.txt", "bb" }, { L"root.txt", "r" } },
             { L"Empty/", L"Folder/" });
 

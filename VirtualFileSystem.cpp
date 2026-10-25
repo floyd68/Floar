@@ -21,18 +21,32 @@ namespace
 
 std::vector<VirtualFileEntry> VirtualFileSystem::ListDirectory(const VirtualPath& dirPath)
 {
+    std::vector<VirtualFileEntry> entries;
+    (void)EnumerateDirectory(dirPath, std::stop_token {}, [&entries](VirtualFileEntry&& entry)
+    {
+        entries.push_back(std::move(entry));
+    });
+    return entries;
+}
+
+bool VirtualFileSystem::EnumerateDirectory(
+    const VirtualPath& dirPath,
+    std::stop_token stop,
+    const std::function<void(VirtualFileEntry&&)>& onEntry)
+{
+    if (stop.stop_requested())
+    {
+        return false;
+    }
     if (dirPath.IsInArchive())
     {
-        return ListArchiveSubdirectory(dirPath.hostPath, dirPath.archiveInnerPath);
+        return EnumerateArchive(dirPath.hostPath, dirPath.archiveInnerPath, stop, onEntry);
     }
-    else if (dirPath.IsArchiveFile())
+    if (dirPath.IsArchiveFile())
     {
-        return ListArchiveRoot(dirPath.hostPath);
+        return EnumerateArchive(dirPath.hostPath, std::wstring(), stop, onEntry);
     }
-    else
-    {
-        return ListFilesystemDirectory(dirPath.hostPath);
-    }
+    return EnumerateFilesystem(dirPath.hostPath, stop, onEntry);
 }
 
 std::vector<uint8_t> VirtualFileSystem::ReadFile(const VirtualPath& filePath)
@@ -120,94 +134,85 @@ void VirtualFileSystem::EnumerateFilesystemDirectory(
     const std::filesystem::path& dirPath,
     const std::function<void(VirtualFileEntry&&)>& onEntry)
 {
-    if (!onEntry || !std::filesystem::exists(dirPath) || !std::filesystem::is_directory(dirPath))
+    if (onEntry)
     {
-        return;
+        (void)EnumerateFilesystem(dirPath, std::stop_token {}, onEntry);
+    }
+}
+
+bool VirtualFileSystem::EnumerateFilesystem(
+    const std::filesystem::path& dirPath,
+    std::stop_token stop,
+    const std::function<void(VirtualFileEntry&&)>& onEntry)
+{
+    // Every operation below may block (network paths): none starts once stop
+    // is requested.
+    std::error_code ec;
+    const bool isDirectory = std::filesystem::is_directory(dirPath, ec);
+    if (stop.stop_requested())
+    {
+        return false;
+    }
+    if (ec || !isDirectory)
+    {
+        return true;
     }
 
-    std::error_code iterEc;
     const auto options = std::filesystem::directory_options::skip_permission_denied;
-    std::filesystem::directory_iterator it(dirPath, options, iterEc);
-    if (iterEc)
+    std::filesystem::directory_iterator it(dirPath, options, ec);
+    if (stop.stop_requested())
     {
-        return;
+        return false;
+    }
+    if (ec)
+    {
+        return true;
     }
 
     const std::filesystem::directory_iterator end {};
-    for (; it != end; it.increment(iterEc))
+    bool skipCurrent = false;   // the last advance failed
+    while (it != end)
     {
-        if (iterEc)
+        if (stop.stop_requested())
         {
-            iterEc.clear();
-            continue;
+            return false;
         }
-
-        const std::filesystem::directory_entry& entry = *it;
-        std::error_code typeEc;
-        const bool isDir = entry.is_directory(typeEc);
-        if (typeEc)
+        if (!skipCurrent)
         {
-            continue;
-        }
-        onEntry(VirtualFileEntry(VirtualPath(entry.path()), isDir, 0, 0));
-    }
-}
-
-std::vector<VirtualFileEntry> VirtualFileSystem::ListFilesystemDirectory(const std::filesystem::path& dirPath)
-{
-    std::vector<VirtualFileEntry> entries;
-    EnumerateFilesystemDirectory(dirPath, [&entries](VirtualFileEntry&& entry)
-    {
-        entries.push_back(std::move(entry));
-    });
-    return entries;
-}
-
-std::vector<VirtualFileEntry> VirtualFileSystem::ListArchiveRoot(const std::filesystem::path& archivePath)
-{
-    std::vector<VirtualFileEntry> entries;
-    auto reader = GetCachedReader(archivePath);
-    if (!reader)
-    {
-        return entries;
-    }
-
-    std::unordered_set<std::wstring> addedDirs;   // ArchiveInnerPathKey
-    for (const auto& archEntry : reader->Entries())
-    {
-        std::wstring normalized = NormalizePath(archEntry.name);
-        auto sepPos = normalized.find(L'/');
-        if (sepPos == std::wstring::npos)
-        {
-            if (archEntry.isDirectory && !addedDirs.insert(ArchiveInnerPathKey(normalized)).second)
+            const std::filesystem::directory_entry& entry = *it;
+            std::error_code typeEc;
+            const bool isDir = entry.is_directory(typeEc);
+            if (!typeEc)
             {
-                continue;   // already listed as the parent of an entry
-            }
-            VirtualPath vpath(archivePath, normalized);
-            entries.emplace_back(vpath, archEntry.isDirectory, archEntry.size, archEntry.modTime);
-        }
-        else
-        {
-            std::wstring dirName = normalized.substr(0, sepPos);
-            if (addedDirs.insert(ArchiveInnerPathKey(dirName)).second)
-            {
-                VirtualPath vpath(archivePath, dirName);
-                entries.emplace_back(vpath, true, 0, 0);
+                onEntry(VirtualFileEntry(VirtualPath(entry.path()), isDir, 0, 0));
             }
         }
+        if (stop.stop_requested())
+        {
+            return false;
+        }
+        it.increment(ec);
+        skipCurrent = static_cast<bool>(ec);
+        ec.clear();
     }
-    return entries;
+    return true;
 }
 
-std::vector<VirtualFileEntry> VirtualFileSystem::ListArchiveSubdirectory(
+bool VirtualFileSystem::EnumerateArchive(
     const std::filesystem::path& archivePath,
-    const std::wstring& innerPath)
+    const std::wstring& innerPath,
+    std::stop_token stop,
+    const std::function<void(VirtualFileEntry&&)>& onEntry)
 {
-    std::vector<VirtualFileEntry> entries;
-    auto reader = GetCachedReader(archivePath);
+    // A canceled open returns no reader (and caches none).
+    auto reader = ArchiveReaderCache::Shared().Get(archivePath, stop);
+    if (stop.stop_requested())
+    {
+        return false;
+    }
     if (!reader)
     {
-        return entries;
+        return true;
     }
 
     std::wstring searchPrefix = NormalizePath(innerPath);
@@ -220,6 +225,10 @@ std::vector<VirtualFileEntry> VirtualFileSystem::ListArchiveSubdirectory(
     std::unordered_set<std::wstring> addedDirs;   // ArchiveInnerPathKey
     for (const auto& archEntry : reader->Entries())
     {
+        if (stop.stop_requested())
+        {
+            return false;
+        }
         std::wstring normalized = NormalizePath(archEntry.name);
         if (normalized.length() <= searchPrefix.length() ||
             StringUtil::ToLower(normalized.substr(0, searchPrefix.length())) != searchPrefixKey)
@@ -235,21 +244,18 @@ std::vector<VirtualFileEntry> VirtualFileSystem::ListArchiveSubdirectory(
             {
                 continue;   // already listed as the parent of an entry
             }
-            VirtualPath vpath(archivePath, normalized);
-            entries.emplace_back(vpath, archEntry.isDirectory, archEntry.size, archEntry.modTime);
+            onEntry(VirtualFileEntry(VirtualPath(archivePath, normalized), archEntry.isDirectory, archEntry.size, archEntry.modTime));
         }
         else
         {
-            std::wstring dirName = relativePath.substr(0, sepPos);
-            std::wstring fullDirPath = searchPrefix + dirName;
+            std::wstring fullDirPath = searchPrefix + relativePath.substr(0, sepPos);
             if (addedDirs.insert(ArchiveInnerPathKey(fullDirPath)).second)
             {
-                VirtualPath vpath(archivePath, fullDirPath);
-                entries.emplace_back(vpath, true, 0, 0);
+                onEntry(VirtualFileEntry(VirtualPath(archivePath, fullDirPath), true, 0, 0));
             }
         }
     }
-    return entries;
+    return true;
 }
 
 std::wstring VirtualFileSystem::NormalizePath(const std::wstring& path)

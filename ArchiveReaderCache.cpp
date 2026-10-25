@@ -7,9 +7,9 @@ namespace Floar
 {
 ArchiveReaderCache::ArchiveReaderCache(size_t capacity, Opener opener)
     : m_capacity(capacity == 0 ? 1 : capacity)
-    , m_opener(opener ? std::move(opener) : Opener([](const std::filesystem::path& path)
+    , m_opener(opener ? std::move(opener) : Opener([](const std::filesystem::path& path, std::stop_token stop)
         {
-            return std::shared_ptr<IArchiveReader>(ArchiveReaderFactory::Open(path));
+            return std::shared_ptr<IArchiveReader>(ArchiveReaderFactory::Open(path, stop));
         }))
 {
 }
@@ -58,7 +58,7 @@ ArchiveReaderCache::Identity ArchiveReaderCache::ReadIdentity(const std::filesys
     return identity;
 }
 
-std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::path& archivePath)
+std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::path& archivePath, std::stop_token stop)
 {
     // One absolute path for the key, the change check and the open.
     const std::filesystem::path path = Resolve(archivePath);
@@ -97,7 +97,7 @@ std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::p
                 std::lock_guard<std::mutex> lock(m_mutex);
                 ++m_openCount;
             }
-            reader = m_opener(path);
+            reader = m_opener(path, stop);
             slot->reader = reader;
             slot->identity = identity;
         }
