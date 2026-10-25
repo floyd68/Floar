@@ -176,21 +176,77 @@ void ArchiveReaderCache::RetireLocked(const std::shared_ptr<Operation>& operatio
     operation->retired = true;
     operation->done = true;
     operation->reader.reset();
-    operation->stop.request_stop();
     if (operation->queued)
     {
+        // Never started: nobody holds its token, so there is nothing to stop.
         operation->queued = false;
         std::erase(m_queue, operation);
     }
-    if (operation->worker != nullptr && operation->worker->handle != nullptr)
+    else if (operation->worker != nullptr)
     {
-        // Best effort, and only while that worker runs this operation (both
-        // are changed under m_mutex), so it never reaches the worker's next open.
-        (void)CancelSynchronousIo(static_cast<HANDLE>(operation->worker->handle));
+        // request_stop runs the opener's stop callbacks: never under m_mutex
+        // and never on a caller's thread.
+        m_stopQueue.push_back(operation);
+        StartDispatcherIfNeededLocked();
+        m_stopAvailable.notify_one();
     }
     // A later caller starts a replacement operation instead of joining this one.
     std::erase(operation->slot->opens, operation);
     operation->finished.notify_all();
+}
+
+void ArchiveReaderCache::StartDispatcherIfNeededLocked()
+{
+    if (m_dispatcher.joinable())
+    {
+        return;
+    }
+    try
+    {
+        // The dispatcher waits for the lock held here before reading the queue.
+        m_dispatcher = std::thread(&ArchiveReaderCache::DispatcherMain, this);
+    }
+    catch (...)
+    {
+        // No thread: the stop stays queued for a later start. Like the OS
+        // cancel this is best effort; Shutdown still reports a stuck open.
+        return;
+    }
+    m_dispatcherHandle = m_dispatcher.native_handle();
+    m_dispatcherLive = true;
+}
+
+void ArchiveReaderCache::DispatcherMain()
+{
+    std::unique_lock<std::mutex> lock(m_mutex);
+    for (;;)
+    {
+        m_stopAvailable.wait(lock, [&] { return m_dispatcherExit || !m_stopQueue.empty(); });
+        if (m_stopQueue.empty())
+        {
+            break;   // exits only once every queued stop was dispatched
+        }
+        std::shared_ptr<Operation> operation = std::move(m_stopQueue.front());
+        m_stopQueue.pop_front();
+
+        lock.unlock();
+        operation->stop.request_stop();   // may run (and block in) opener callbacks
+        lock.lock();
+
+        if (operation->worker != nullptr && operation->worker->handle != nullptr)
+        {
+            // Best effort, and only while that worker still runs this operation
+            // (both are changed under m_mutex), so it never reaches the
+            // worker's next open.
+            (void)CancelSynchronousIo(static_cast<HANDLE>(operation->worker->handle));
+        }
+        lock.unlock();
+        operation.reset();   // may release the last reference to its slot
+        lock.lock();
+    }
+
+    m_dispatcherLive = false;
+    m_workerExited.notify_all();
 }
 
 void ArchiveReaderCache::StartWorkerIfNeededLocked()
@@ -292,8 +348,21 @@ void ArchiveReaderCache::WorkerMain(Worker* self)
 
 bool ArchiveReaderCache::Shutdown(std::chrono::milliseconds bound)
 {
-    std::list<Worker> workers;
-    std::unordered_map<std::wstring, Node> nodes;
+    const auto deadline = std::chrono::steady_clock::now() + (std::min)(bound, std::chrono::milliseconds(std::chrono::hours(24 * 365)));
+    const auto remainingMs = [&]() -> DWORD
+    {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+        return static_cast<DWORD>(std::clamp<long long>(left.count(), 0, INFINITE - 1));
+    };
+
+    // One Shutdown at a time; a concurrent one waits within its own bound.
+    std::unique_lock<std::timed_mutex> shutdownLock(m_shutdownMutex, deadline);
+    if (!shutdownLock.owns_lock())
+    {
+        return false;
+    }
+
+    std::vector<HANDLE> threads;
     {
         std::unique_lock<std::mutex> lock(m_mutex);
         if (!m_shutdown)
@@ -311,14 +380,43 @@ bool ArchiveReaderCache::Shutdown(std::chrono::milliseconds bound)
                 }
             }
             m_workAvailable.notify_all();
+            m_dispatcherExit = true;
+            m_stopAvailable.notify_all();
         }
 
-        if (!m_workerExited.wait_for(lock, bound, [&] { return m_liveWorkers == 0; }))
+        if (!m_workerExited.wait_until(lock, deadline, [&] { return m_liveWorkers == 0 && !m_dispatcherLive; }))
         {
             return false;   // still owned: a later call waits again
         }
+        for (Worker& worker : m_workers)
+        {
+            threads.push_back(static_cast<HANDLE>(worker.handle));
+        }
+        if (m_dispatcher.joinable())
+        {
+            threads.push_back(static_cast<HANDLE>(m_dispatcherHandle));
+        }
+    }
+
+    // Leaving the loop is not the end of the thread: thread-local destructors
+    // still run on it. Join only threads whose native thread has ended.
+    for (HANDLE thread : threads)
+    {
+        if (WaitForSingleObject(thread, remainingMs()) != WAIT_OBJECT_0)
+        {
+            return false;   // still owned: a later call waits again
+        }
+    }
+
+    std::list<Worker> workers;
+    std::thread dispatcher;
+    std::unordered_map<std::wstring, Node> nodes;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
         workers = std::move(m_workers);
         m_workers.clear();
+        dispatcher = std::move(m_dispatcher);
+        m_dispatcherHandle = nullptr;
         // Waiters may still be leaving Get; their slots stay alive through their
         // own references. Release the readers outside the lock.
         nodes = std::move(m_nodes);
@@ -326,13 +424,17 @@ bool ArchiveReaderCache::Shutdown(std::chrono::milliseconds bound)
         m_lru.clear();
     }
 
-    // Every worker has left its loop; join them before any static teardown.
+    // Every thread has ended; join them before any static teardown.
     for (Worker& worker : workers)
     {
         if (worker.thread.joinable())
         {
             worker.thread.join();
         }
+    }
+    if (dispatcher.joinable())
+    {
+        dispatcher.join();
     }
     return true;
 }
@@ -369,6 +471,12 @@ size_t ArchiveReaderCache::WorkerCount() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_workers.size();
+}
+
+size_t ArchiveReaderCache::ThreadCount() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_workers.size() + (m_dispatcher.joinable() ? 1 : 0);
 }
 
 size_t ArchiveReaderCache::RunningOpenCount() const

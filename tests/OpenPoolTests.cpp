@@ -804,3 +804,197 @@ FLOAR_TEST(Pool_ReplacedArchiveGetsItsOwnOpenAndTheNewestReaderIsCached)
     FLOAR_CHECK(cache.OpenCount() == 2);
     FLOAR_CHECK(cache.Shutdown(5s));
 }
+
+FLOAR_TEST(Pool_StopCallbacksRunOffTheCallerAndOutsideTheCacheLock)
+{
+    ScopedDir dir { TempDir(L"callback") };
+    const auto a = dir.File(L"a.zip");
+    const auto b = dir.File(L"b.zip");
+
+    ArchiveReaderCache* self = nullptr;
+    std::mutex mutex;
+    std::condition_variable_any changed;
+    int entered = 0;
+    std::vector<std::thread::id> callbackThreads;
+    ArchiveReaderCache cache(4, [&](const std::filesystem::path&, std::stop_token stop) -> std::shared_ptr<IArchiveReader>
+    {
+        // Re-enters the cache from the stop callback.
+        std::stop_callback onStop(stop, [&]
+        {
+            (void)(self->Size() + self->RunningOpenCount() + self->WaitingCount() + self->ThreadCount());
+            std::lock_guard<std::mutex> lock(mutex);
+            callbackThreads.push_back(std::this_thread::get_id());
+            changed.notify_all();
+        });
+        std::unique_lock<std::mutex> lock(mutex);
+        ++entered;
+        changed.notify_all();
+        (void)changed.wait(lock, stop, [] { return false; });
+        return nullptr;
+    });
+    self = &cache;
+    const auto waitFor = [&](const std::function<bool()>& condition)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        return changed.wait_for(lock, 5s, condition);
+    };
+
+    // The last interest leaves: the open's callback runs, but not on the caller.
+    std::stop_source stopA;
+    std::promise<std::thread::id> callerThread;
+    auto callerA = std::async(std::launch::async, [&]
+    {
+        callerThread.set_value(std::this_thread::get_id());
+        return cache.Get(a, stopA.get_token());
+    });
+    FLOAR_REQUIRE(waitFor([&] { return entered == 1; }));
+    stopA.request_stop();
+    FLOAR_REQUIRE(Ready(callerA));
+    FLOAR_CHECK(callerA.get() == nullptr);
+    FLOAR_REQUIRE(waitFor([&] { return callbackThreads.size() == 1; }));
+    const std::thread::id callerId = callerThread.get_future().get();
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        FLOAR_CHECK(callbackThreads[0] != callerId);
+        FLOAR_CHECK(callbackThreads[0] != std::this_thread::get_id());
+    }
+
+    // Shutdown: the callback runs without the cache lock, so it cannot deadlock.
+    auto callerB = GetAsync(cache, b);
+    FLOAR_REQUIRE(waitFor([&] { return entered == 2; }));
+    FLOAR_CHECK(cache.Shutdown(5s));
+    FLOAR_REQUIRE(Ready(callerB));
+    FLOAR_CHECK(callerB.get() == nullptr);
+    std::lock_guard<std::mutex> lock(mutex);
+    FLOAR_REQUIRE(callbackThreads.size() == 2);
+    FLOAR_CHECK(callbackThreads[1] != std::this_thread::get_id());
+}
+
+FLOAR_TEST(Pool_BlockingStopCallbackCannotTrapShutdown)
+{
+    ScopedDir dir { TempDir(L"callback-block") };
+    const auto a = dir.File(L"a.zip");
+
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false;
+    bool callbackEntered = false;
+    bool releaseCallback = false;
+    ArchiveReaderCache cache(4, [&](const std::filesystem::path&, std::stop_token stop) -> std::shared_ptr<IArchiveReader>
+    {
+        std::stop_callback onStop(stop, [&]
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            callbackEntered = true;
+            changed.notify_all();
+            changed.wait(lock, [&] { return releaseCallback; });
+        });
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            entered = true;
+            changed.notify_all();
+        }
+        std::mutex waitMutex;
+        std::condition_variable_any stopped;
+        std::unique_lock<std::mutex> waitLock(waitMutex);
+        (void)stopped.wait(waitLock, stop, [] { return false; });
+        return nullptr;
+    });
+
+    auto caller = GetAsync(cache, a);   // untokened
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        FLOAR_REQUIRE(changed.wait_for(lock, 5s, [&] { return entered; }));
+    }
+    const auto start = std::chrono::steady_clock::now();
+    FLOAR_CHECK(!cache.Shutdown(100ms));
+    FLOAR_CHECK(std::chrono::steady_clock::now() - start < 5s);
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        FLOAR_CHECK(changed.wait_for(lock, 5s, [&] { return callbackEntered; }));
+    }
+    // The waiter was released although the stop is still being dispatched.
+    FLOAR_REQUIRE(Ready(caller));
+    FLOAR_CHECK(caller.get() == nullptr);
+    FLOAR_CHECK(cache.ThreadCount() == 2);   // the worker and the dispatcher are kept
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        releaseCallback = true;
+        changed.notify_all();
+    }
+    FLOAR_CHECK(cache.Shutdown(5s));
+    FLOAR_CHECK(cache.ThreadCount() == 0);
+}
+
+namespace
+{
+    // A thread-local whose destructor blocks (on the native thread, after the
+    // worker loop returned) until the test opens its gate.
+    struct TlsGate
+    {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool armed { false };
+        bool entered { false };
+        bool released { false };
+    };
+    TlsGate g_tlsGate;
+
+    struct BlockingThreadLocal
+    {
+        bool used { false };
+        ~BlockingThreadLocal()
+        {
+            if (!used)
+            {
+                return;
+            }
+            std::unique_lock<std::mutex> lock(g_tlsGate.mutex);
+            if (!g_tlsGate.armed)
+            {
+                return;
+            }
+            g_tlsGate.entered = true;
+            g_tlsGate.changed.notify_all();
+            g_tlsGate.changed.wait(lock, [] { return g_tlsGate.released; });
+        }
+    };
+    thread_local BlockingThreadLocal t_blocking;
+}
+
+FLOAR_TEST(Pool_ShutdownWaitsForThreadLocalDestructors)
+{
+    ScopedDir dir { TempDir(L"tls") };
+    const auto a = dir.File(L"a.zip");
+    {
+        std::lock_guard<std::mutex> lock(g_tlsGate.mutex);
+        g_tlsGate.armed = true;
+        g_tlsGate.entered = false;
+        g_tlsGate.released = false;
+    }
+    ArchiveReaderCache cache(4, [](const std::filesystem::path&, std::stop_token) -> std::shared_ptr<IArchiveReader>
+    {
+        t_blocking.used = true;
+        return std::make_shared<GenReader>(1);
+    });
+    FLOAR_REQUIRE(cache.Get(a) != nullptr);
+
+    // The worker leaves its loop, then blocks in its thread-local destructor.
+    FLOAR_CHECK(!cache.Shutdown(100ms));
+    {
+        std::unique_lock<std::mutex> lock(g_tlsGate.mutex);
+        FLOAR_CHECK(g_tlsGate.changed.wait_for(lock, 5s, [] { return g_tlsGate.entered; }));
+    }
+    FLOAR_CHECK(cache.WorkerCount() == 1);   // still owned, not joined
+    FLOAR_CHECK(!cache.Shutdown(50ms));
+
+    {
+        std::lock_guard<std::mutex> lock(g_tlsGate.mutex);
+        g_tlsGate.released = true;
+        g_tlsGate.armed = false;
+        g_tlsGate.changed.notify_all();
+    }
+    FLOAR_CHECK(cache.Shutdown(5s));
+    FLOAR_CHECK(cache.WorkerCount() == 0);
+}

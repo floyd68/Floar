@@ -47,8 +47,14 @@ namespace Floar
 //   stop_source and is stopped only when its last interested caller left (it
 //   is then retired: it publishes nothing, and a caller arriving afterwards
 //   starts a replacement operation instead of joining the stopped one) or at
-//   Shutdown. Stopping also calls a best-effort CancelSynchronousIo on the worker running it; that call is made
-//   under the cache lock while the worker is assigned to that operation, so it
+//   Shutdown.
+// - Stopping: the stop request runs on a stop-dispatch thread owned by the
+//   cache (started with the first stop of a running open), never under the
+//   cache lock and never on a caller's thread, so the opener's stop callbacks
+//   may query the cache, and one that blocks delays only that thread (Shutdown
+//   still returns within its bound). After the request the dispatcher calls a
+//   best-effort CancelSynchronousIo on the worker; that call is made under the
+//   cache lock while the worker is still assigned to that operation, so it
 //   never reaches the worker's next open. Not every OS call honours it.
 // - Admission: one FIFO queue, one priority, shared by callers with and
 //   without a stop token. A queued caller whose token stops leaves the queue
@@ -96,9 +102,11 @@ public:
 
     // Stops every queued and running open (through its stop_source plus the
     // best-effort OS cancel), releases every waiting caller with null, and waits
-    // up to `bound` for the workers to exit. Returns true once every worker was
-    // joined; false when one is still inside its opener (for example blocked in
-    // an OS call that ignores cancellation), in which case the cache keeps
+    // up to `bound` for the workers and the stop dispatcher to finish - their
+    // native threads included, so thread-local destructors have run. Returns
+    // true once every thread was joined; false when one is still running (an
+    // opener blocked in an OS call that ignores cancellation, a blocking stop
+    // callback, a thread-local destructor), in which case the cache keeps
     // ownership of it and a later call waits again. Safe before first use (then
     // starts nothing and returns true) and repeatable. Once it began, Get returns
     // null and no worker or open starts.
@@ -110,7 +118,9 @@ public:
     // Observability (tests): worker threads started and not yet joined, opens
     // running on a worker (retired ones included until their opener returns),
     // opens waiting for a worker, and callers waiting for an open.
+    // ThreadCount adds the stop dispatcher (once started, until joined).
     size_t WorkerCount() const;
+    size_t ThreadCount() const;
     size_t RunningOpenCount() const;
     size_t QueuedOpenCount() const;
     size_t WaitingCount() const;
@@ -180,6 +190,9 @@ private:
     // Starts a worker when queued opens exceed the idle workers and the bound allows it.
     void StartWorkerIfNeededLocked();
     void WorkerMain(Worker* self);
+    // Starts the stop-dispatch thread on the first stop of a running open.
+    void StartDispatcherIfNeededLocked();
+    void DispatcherMain();
 
     const size_t m_capacity;
     const Opener m_opener;
@@ -199,5 +212,16 @@ private:
     size_t m_running { 0 };
     size_t m_waiting { 0 };
     bool m_shutdown { false };
+
+    // Stop dispatch: running operations whose stop is still to be requested.
+    std::condition_variable m_stopAvailable {};
+    std::deque<std::shared_ptr<Operation>> m_stopQueue {};
+    std::thread m_dispatcher {};
+    void* m_dispatcherHandle { nullptr };
+    bool m_dispatcherLive { false };  // started and not yet out of its loop
+    bool m_dispatcherExit { false };
+
+    // Serializes Shutdown calls (each waits for it within its own bound).
+    std::timed_mutex m_shutdownMutex {};
 };
 }
