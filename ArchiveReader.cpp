@@ -2,15 +2,18 @@
 #include "ArchiveTypes.h"
 #include "StringUtil.h"
 #include "FloarLog.h"
+#include "VirtualPath.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <clocale>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <Windows.h>
 #include <dxgiformat.h>
 
@@ -163,6 +166,36 @@ namespace
         std::replace(path.begin(), path.end(), L'\\', L'/');
         return path;
     }
+
+    // Directory keys (ArchiveInnerPathKey) of every explicit directory entry and
+    // every parent of an entry, built while a reader scans its table.
+    class DirectoryIndex
+    {
+    public:
+        void Add(const ArchiveEntry& entry)
+        {
+            const std::wstring key = ArchiveInnerPathKey(entry.name);
+            if (entry.isDirectory && !key.empty())
+            {
+                m_directories.insert(key);
+            }
+            for (size_t pos = key.find(L'/'); pos != std::wstring::npos; pos = key.find(L'/', pos + 1))
+            {
+                m_directories.insert(key.substr(0, pos));
+            }
+        }
+
+        bool Contains(const std::wstring& dirPath) const
+        {
+            return m_directories.find(ArchiveInnerPathKey(dirPath)) != m_directories.end();
+        }
+
+    private:
+        std::unordered_set<std::wstring> m_directories {};
+    };
+
+    std::atomic<size_t> g_statusQueries { 0 };
+    std::atomic<size_t> g_opens { 0 };
 
     std::wstring ExtensionFromFourCC(const char(&ext)[4])
     {
@@ -555,6 +588,7 @@ class Ba2Reader : public IArchiveReader
     std::filesystem::path m_path;
     std::vector<ArchiveEntry> m_entries;
     std::unordered_map<std::wstring, size_t> m_entryMap;
+    DirectoryIndex m_directories;
     std::vector<Ba2FileInfo> m_files;
     std::wstring m_formatName { L"BA2" };
 
@@ -565,14 +599,19 @@ public:
         ScanArchive();
     }
 
-    std::vector<ArchiveEntry> ListEntries() override
+    const std::vector<ArchiveEntry>& Entries() const override
     {
         return m_entries;
     }
 
+    bool HasDirectory(const std::wstring& dirPath) const override
+    {
+        return m_directories.Contains(dirPath);
+    }
+
     std::vector<uint8_t> ExtractToMemory(const std::wstring& entryPath) override
     {
-        const std::wstring key = Floar::StringUtil::ToLower(NormalizeArchivePath(entryPath));
+        const std::wstring key = ArchiveInnerPathKey(entryPath);
         auto it = m_entryMap.find(key);
         if (it == m_entryMap.end())
         {
@@ -590,7 +629,7 @@ public:
 
     bool HasEntry(const std::wstring& entryPath) override
     {
-        return m_entryMap.find(Floar::StringUtil::ToLower(NormalizeArchivePath(entryPath))) != m_entryMap.end();
+        return m_entryMap.find(ArchiveInnerPathKey(entryPath)) != m_entryMap.end();
     }
 
     std::wstring GetFormatName() const override
@@ -918,7 +957,8 @@ private:
             entry.isDirectory = false;
             entry.modTime = 0;
 
-            m_entryMap[Floar::StringUtil::ToLower(NormalizeArchivePath(info.name))] = i;
+            m_entryMap[ArchiveInnerPathKey(info.name)] = i;
+            m_directories.Add(entry);
             m_entries.push_back(entry);
         }
     }
@@ -1097,6 +1137,7 @@ class BsaReader : public IArchiveReader
     std::filesystem::path m_path;
     std::vector<ArchiveEntry> m_entries;
     std::unordered_map<std::wstring, size_t> m_entryMap;
+    DirectoryIndex m_directories;
     std::vector<BsaFileInfo> m_files;
     uint32_t m_version = 0;
     uint32_t m_archiveFlags = 0;
@@ -1109,14 +1150,19 @@ public:
         ScanArchive();
     }
 
-    std::vector<ArchiveEntry> ListEntries() override
+    const std::vector<ArchiveEntry>& Entries() const override
     {
         return m_entries;
     }
 
+    bool HasDirectory(const std::wstring& dirPath) const override
+    {
+        return m_directories.Contains(dirPath);
+    }
+
     std::vector<uint8_t> ExtractToMemory(const std::wstring& entryPath) override
     {
-        const std::wstring key = Floar::StringUtil::ToLower(NormalizeArchivePath(entryPath));
+        const std::wstring key = ArchiveInnerPathKey(entryPath);
         auto it = m_entryMap.find(key);
         if (it == m_entryMap.end())
         {
@@ -1127,7 +1173,7 @@ public:
 
     bool HasEntry(const std::wstring& entryPath) override
     {
-        return m_entryMap.find(Floar::StringUtil::ToLower(NormalizeArchivePath(entryPath))) != m_entryMap.end();
+        return m_entryMap.find(ArchiveInnerPathKey(entryPath)) != m_entryMap.end();
     }
 
     std::wstring GetFormatName() const override
@@ -1466,8 +1512,9 @@ private:
             entry.isDirectory = false;
             entry.modTime = 0;
 
-            m_entryMap[Floar::StringUtil::ToLower(info.name)] = m_files.size();
+            m_entryMap[ArchiveInnerPathKey(info.name)] = m_files.size();
             m_files.push_back(info);
+            m_directories.Add(entry);
             m_entries.push_back(entry);
         }
 
@@ -1482,6 +1529,7 @@ class LibArchiveReader : public IArchiveReader
     std::filesystem::path m_path;
     std::vector<ArchiveEntry> m_entries;
     std::unordered_map<std::wstring, size_t> m_entryMap;
+    DirectoryIndex m_directories;
     std::wstring m_formatName;
 
 public:
@@ -1493,16 +1541,21 @@ public:
         FLOAR_LOG_INFO("[LibArchiveReader] Scanned, found {} entries", m_entries.size());
     }
 
-    std::vector<ArchiveEntry> ListEntries() override
+    const std::vector<ArchiveEntry>& Entries() const override
     {
         return m_entries;
+    }
+
+    bool HasDirectory(const std::wstring& dirPath) const override
+    {
+        return m_directories.Contains(dirPath);
     }
 
     std::vector<uint8_t> ExtractToMemory(const std::wstring& entryPath) override
     {
         FLOAR_LOG_DEBUG("[LibArchiveReader] ExtractToMemory: {}", Log::ToUtf8(entryPath));
 
-        auto it = m_entryMap.find(Floar::StringUtil::ToLower(NormalizeArchivePath(entryPath)));
+        auto it = m_entryMap.find(ArchiveInnerPathKey(entryPath));
         if (it == m_entryMap.end())
         {
             FLOAR_LOG_WARN("[LibArchiveReader] Entry not found in map");
@@ -1627,7 +1680,7 @@ public:
 
     bool HasEntry(const std::wstring& entryPath) override
     {
-        return m_entryMap.find(Floar::StringUtil::ToLower(NormalizeArchivePath(entryPath))) != m_entryMap.end();
+        return m_entryMap.find(ArchiveInnerPathKey(entryPath)) != m_entryMap.end();
     }
 
     std::wstring GetFormatName() const override
@@ -1706,8 +1759,9 @@ private:
             archEntry.modTime = archive_entry_mtime(entry);
 
             size_t index = m_entries.size();
+            m_directories.Add(archEntry);
             m_entries.push_back(archEntry);
-            m_entryMap[Floar::StringUtil::ToLower(NormalizeArchivePath(archEntry.name))] = index;
+            m_entryMap[ArchiveInnerPathKey(archEntry.name)] = index;
         }
 
         archive_read_free(a);
@@ -1719,14 +1773,29 @@ private:
 
 bool ArchiveReaderFactory::IsArchiveFile(const std::filesystem::path& path)
 {
-    if (!std::filesystem::exists(path) || !std::filesystem::is_regular_file(path))
+    // Extension first: browsing calls this for every file, and a status query
+    // can be slow (network paths).
+    if (!HasArchiveExtension(path.filename().wstring()))
         return false;
 
-    return HasArchiveExtension(path.filename().wstring());
+    ++g_statusQueries;
+    std::error_code ec;
+    return std::filesystem::is_regular_file(std::filesystem::status(path, ec)) && !ec;
+}
+
+size_t ArchiveReaderFactory::StatusQueryCountForTesting()
+{
+    return g_statusQueries.load();
+}
+
+size_t ArchiveReaderFactory::OpenCountForTesting()
+{
+    return g_opens.load();
 }
 
 std::unique_ptr<IArchiveReader> ArchiveReaderFactory::Open(const std::filesystem::path& path)
 {
+    ++g_opens;
     if (!IsArchiveFile(path))
         return nullptr;
 
@@ -1736,7 +1805,7 @@ std::unique_ptr<IArchiveReader> ArchiveReaderFactory::Open(const std::filesystem
         if (ext == L".ba2")
         {
             auto reader = std::make_unique<Ba2Reader>(path);
-            if (reader->ListEntries().empty())
+            if (reader->Entries().empty())
             {
                 return nullptr;
             }
@@ -1745,7 +1814,7 @@ std::unique_ptr<IArchiveReader> ArchiveReaderFactory::Open(const std::filesystem
         if (ext == L".bsa")
         {
             auto reader = std::make_unique<BsaReader>(path);
-            if (reader->ListEntries().empty())
+            if (reader->Entries().empty())
             {
                 return nullptr;
             }
@@ -1754,7 +1823,7 @@ std::unique_ptr<IArchiveReader> ArchiveReaderFactory::Open(const std::filesystem
 
 #if FLOAR_ENABLE_COMMON_ARCHIVES
         auto reader = std::make_unique<LibArchiveReader>(path);
-        if (reader->ListEntries().empty())
+        if (reader->Entries().empty())
         {
             return nullptr;
         }

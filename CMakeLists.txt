@@ -148,6 +148,7 @@ add_library(Floar STATIC)
 
 target_sources(Floar PRIVATE
     ArchiveReader.cpp
+    ArchiveReaderCache.cpp
     FloarLog.cpp
     VirtualFileSystem.cpp
     VirtualPath.cpp
@@ -183,7 +184,7 @@ else()
 endif()
 
 if(MSVC)
-    target_compile_options(Floar PRIVATE /permissive-)
+    target_compile_options(Floar PRIVATE /permissive- /utf-8)
 endif()
 
 if(FLOAR_BUILD_TESTS)

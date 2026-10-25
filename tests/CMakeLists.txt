@@ -6,6 +6,7 @@ add_executable(FloarTests
     TestHarness.h
     TestMain.cpp
     LogTests.cpp
+    VfsTests.cpp
 )
 
 target_include_directories(FloarTests PRIVATE
@@ -34,5 +35,6 @@ if(MSVC)
 endif()
 
 add_test(NAME Floar.Log COMMAND FloarTests Log_)
+add_test(NAME Floar.Vfs COMMAND FloarTests Vfs)
 # Safety net only: the tests contain no unbounded waits.
-set_tests_properties(Floar.Log PROPERTIES TIMEOUT 120)
+set_tests_properties(Floar.Log Floar.Vfs PROPERTIES TIMEOUT 120)
