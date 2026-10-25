@@ -19,7 +19,10 @@ namespace Floar
 // reader is shared across threads.
 //
 // - Keys: HostPathKey of the absolute path (VirtualPath.h), so equivalent
-//   spellings share one reader.
+//   spellings share one reader. The path is made absolute once per lookup and
+//   that same path is used for the key, the change check and the open, so a
+//   reader never keeps a relative path whose meaning changes with the current
+//   directory.
 // - Change detection: the file's size and last-write time, read once per
 //   lookup. A reader is reopened when either differs. When the metadata cannot
 //   be read (file locked, deleted, offline), a cached reader is kept - reads
@@ -30,7 +33,10 @@ namespace Floar
 //   opens of other archives. Callers asking for the same archive while it opens
 //   wait for that single open.
 // - Capacity: least-recently-used readers are evicted one at a time; callers
-//   still holding an evicted reader keep using it.
+//   still holding an evicted reader keep using it. An archive with a lookup in
+//   progress (opening, or waiting for its open) is never evicted, so its
+//   per-archive coordination survives and it is never opened twice at once;
+//   the cache may exceed its capacity until those lookups finish.
 class ArchiveReaderCache
 {
 public:
@@ -67,6 +73,7 @@ private:
         std::mutex openMutex {};
         std::shared_ptr<IArchiveReader> reader {};  // guarded by openMutex
         Identity identity {};                       // guarded by openMutex
+        size_t activeLookups { 0 };                 // guarded by m_mutex
     };
 
     struct Node
@@ -75,7 +82,9 @@ private:
         std::list<std::wstring>::iterator lruPosition {};
     };
 
+    static std::filesystem::path Resolve(const std::filesystem::path& archivePath);
     static Identity ReadIdentity(const std::filesystem::path& archivePath);
+    // Evicts least-recently-used entries without an active lookup.
     void EvictLocked();
 
     const size_t m_capacity;

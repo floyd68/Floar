@@ -293,6 +293,131 @@ FLOAR_TEST(VfsCache_SlowOpenDoesNotBlockOtherArchives)
     std::filesystem::remove_all(dir, ec);
 }
 
+FLOAR_TEST(VfsCache_EvictionNeverSplitsAnOpenInProgress)
+{
+    const std::filesystem::path dir = TempDir(L"evict-open");
+    const auto a = dir / L"a.zip";
+    const auto b = dir / L"b.zip";
+    WriteText(a, "a");
+    WriteText(b, "b");
+
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool aEntered = false;
+    bool releaseA = false;
+    std::atomic<int> aOpens { 0 };
+    ArchiveReaderCache cache(1, [&](const std::filesystem::path& path) -> std::shared_ptr<IArchiveReader>
+    {
+        if (path.filename() == L"a.zip")
+        {
+            ++aOpens;
+            std::unique_lock<std::mutex> lock(mutex);
+            aEntered = true;
+            changed.notify_all();
+            changed.wait(lock, [&] { return releaseA; });
+        }
+        return std::make_shared<FakeReader>();
+    });
+
+    auto first = std::async(std::launch::async, [&] { return cache.Get(a); });
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        FLOAR_REQUIRE(changed.wait_for(lock, 5s, [&] { return aEntered; }));
+    }
+    // Capacity 1: B would evict A, but A is still opening.
+    FLOAR_CHECK(cache.Get(b) != nullptr);
+    // A second request for A waits for the first open instead of starting another.
+    auto second = std::async(std::launch::async, [&] { return cache.Get(a); });
+    FLOAR_CHECK(second.wait_for(100ms) == std::future_status::timeout);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        releaseA = true;
+        changed.notify_all();
+    }
+    const auto readerA = first.get();
+    FLOAR_CHECK(readerA != nullptr);
+    FLOAR_CHECK(second.get() == readerA);
+    FLOAR_CHECK(aOpens == 1);
+    // Back within capacity once nothing is in use.
+    FLOAR_CHECK(cache.Size() == 1);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+namespace
+{
+    // Records the path it was opened with.
+    class PathReader final : public IArchiveReader
+    {
+    public:
+        explicit PathReader(std::filesystem::path path)
+            : path(std::move(path))
+        {
+        }
+
+        const std::vector<ArchiveEntry>& Entries() const override { return m_entries; }
+        std::vector<uint8_t> ExtractToMemory(const std::wstring&) override { return {}; }
+        bool HasEntry(const std::wstring&) override { return false; }
+        bool HasDirectory(const std::wstring&) const override { return false; }
+        std::wstring GetFormatName() const override { return L"path"; }
+
+        const std::filesystem::path path;
+
+    private:
+        std::vector<ArchiveEntry> m_entries {};
+    };
+
+    struct ScopedCurrentPath
+    {
+        std::filesystem::path saved = std::filesystem::current_path();
+        ~ScopedCurrentPath()
+        {
+            std::error_code ec;
+            std::filesystem::current_path(saved, ec);
+        }
+    };
+}
+
+FLOAR_TEST(VfsCache_OpensTheAbsolutePathItIsKeyedBy)
+{
+    const std::filesystem::path dir = TempDir(L"cwd");
+    const auto dirA = dir / L"A";
+    const auto dirB = dir / L"B";
+    std::filesystem::create_directories(dirA);
+    std::filesystem::create_directories(dirB);
+    WriteText(dirA / L"pack.zip", "a");
+    WriteText(dirB / L"pack.zip", "bb");
+    ArchiveReaderCache cache(4, [](const std::filesystem::path& path)
+    {
+        return std::make_shared<PathReader>(path);
+    });
+
+    ScopedCurrentPath restore;
+    // Relative lookup first: the reader is opened with the absolute path.
+    std::filesystem::current_path(dirA);
+    const auto fromRelative = std::dynamic_pointer_cast<PathReader>(cache.Get(L"pack.zip"));
+    FLOAR_REQUIRE(fromRelative != nullptr);
+    FLOAR_CHECK(fromRelative->path.is_absolute());
+    FLOAR_CHECK(std::filesystem::equivalent(fromRelative->path, dirA / L"pack.zip"));
+
+    // After a directory change, the absolute lookup shares that reader, which
+    // still refers to A's archive.
+    std::filesystem::current_path(dirB);
+    FLOAR_CHECK(cache.Get(dirA / L"pack.zip") == fromRelative);
+    FLOAR_CHECK(std::filesystem::equivalent(fromRelative->path, dirA / L"pack.zip"));
+
+    // The same relative spelling now names B's archive: a different reader.
+    const auto inB = std::dynamic_pointer_cast<PathReader>(cache.Get(L"pack.zip"));
+    FLOAR_REQUIRE(inB != nullptr);
+    FLOAR_CHECK(inB != fromRelative);
+    FLOAR_CHECK(std::filesystem::equivalent(inB->path, dirB / L"pack.zip"));
+
+    std::filesystem::current_path(restore.saved);
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 #if FLOAR_ENABLE_COMMON_ARCHIVES
 namespace
 {

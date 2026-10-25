@@ -20,11 +20,16 @@ ArchiveReaderCache& ArchiveReaderCache::Shared()
     return cache;
 }
 
-std::wstring ArchiveReaderCache::Key(const std::filesystem::path& archivePath)
+std::filesystem::path ArchiveReaderCache::Resolve(const std::filesystem::path& archivePath)
 {
     std::error_code ec;
-    const std::filesystem::path absolute = std::filesystem::absolute(archivePath, ec);
-    return HostPathKey(ec ? archivePath : absolute);
+    std::filesystem::path absolute = std::filesystem::absolute(archivePath, ec);
+    return ec ? archivePath : absolute;
+}
+
+std::wstring ArchiveReaderCache::Key(const std::filesystem::path& archivePath)
+{
+    return HostPathKey(Resolve(archivePath));
 }
 
 ArchiveReaderCache::Identity ArchiveReaderCache::ReadIdentity(const std::filesystem::path& archivePath)
@@ -55,8 +60,10 @@ ArchiveReaderCache::Identity ArchiveReaderCache::ReadIdentity(const std::filesys
 
 std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::path& archivePath)
 {
-    const std::wstring key = Key(archivePath);
-    const Identity identity = ReadIdentity(archivePath);
+    // One absolute path for the key, the change check and the open.
+    const std::filesystem::path path = Resolve(archivePath);
+    const std::wstring key = HostPathKey(path);
+    const Identity identity = ReadIdentity(path);
 
     std::shared_ptr<Slot> slot;
     {
@@ -71,8 +78,9 @@ std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::p
             slot = std::make_shared<Slot>();
             m_lru.push_front(key);
             m_nodes.emplace(key, Node { slot, m_lru.begin() });
-            EvictLocked();
         }
+        ++slot->activeLookups;   // pins the slot against eviction
+        EvictLocked();
     }
 
     std::shared_ptr<IArchiveReader> reader;
@@ -81,37 +89,50 @@ std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::p
         std::lock_guard<std::mutex> openLock(slot->openMutex);
         if (slot->reader && (!identity.known || slot->identity == identity))
         {
-            return slot->reader;
+            reader = slot->reader;
         }
-
+        else
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            ++m_openCount;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                ++m_openCount;
+            }
+            reader = m_opener(path);
+            slot->reader = reader;
+            slot->identity = identity;
         }
-        reader = m_opener(archivePath);
-        slot->reader = reader;
-        slot->identity = identity;
     }
 
-    if (!reader)
     {
-        // Do not let unopenable paths occupy capacity.
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (auto it = m_nodes.find(key); it != m_nodes.end() && it->second.slot == slot)
+        --slot->activeLookups;
+        // Do not let unopenable paths occupy capacity (unless a waiter retries).
+        if (!reader && slot->activeLookups == 0)
         {
-            m_lru.erase(it->second.lruPosition);
-            m_nodes.erase(it);
+            if (auto it = m_nodes.find(key); it != m_nodes.end() && it->second.slot == slot)
+            {
+                m_lru.erase(it->second.lruPosition);
+                m_nodes.erase(it);
+            }
         }
+        EvictLocked();   // entries skipped while pinned
     }
     return reader;
 }
 
 void ArchiveReaderCache::EvictLocked()
 {
-    while (m_nodes.size() > m_capacity && !m_lru.empty())
+    auto it = m_lru.end();
+    while (m_nodes.size() > m_capacity && it != m_lru.begin())
     {
-        m_nodes.erase(m_lru.back());
-        m_lru.pop_back();
+        --it;
+        auto node = m_nodes.find(*it);
+        if (node->second.slot->activeLookups != 0)
+        {
+            continue;   // in use: keep its coordination state
+        }
+        m_nodes.erase(node);
+        it = m_lru.erase(it);
     }
 }
 
