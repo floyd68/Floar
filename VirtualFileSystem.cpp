@@ -1,74 +1,21 @@
 #include "VirtualFileSystem.h"
 #include "ArchiveReader.h"
+#include "ArchiveReaderCache.h"
 #include "StringUtil.h"
 #include "FloarLog.h"
 #include <algorithm>
 #include <fstream>
 #include <memory>
-#include <mutex>
 #include <system_error>
-#include <unordered_map>
 #include <unordered_set>
 
 namespace Floar
 {
 namespace
 {
-    bool StartsWith(const std::wstring& str, const std::wstring& prefix)
-    {
-        if (str.length() < prefix.length())
-        {
-            return false;
-        }
-        return str.compare(0, prefix.length(), prefix) == 0;
-    }
-
-    // Archive-reader cache. Opening a reader parses the whole file table
-    // (Ba2Reader/BsaReader::ScanArchive), so re-Opening the same archive for
-    // every ListDirectory/ReadFile/IsDirectory call - e.g. once per thumbnail
-    // while browsing a BSA/BA2 - is O(entries) wasted work per call and starves
-    // the UI + load pool. A scanned reader is read-only (ExtractToMemory opens
-    // its own local file handle each call; ListEntries/HasEntry only read const
-    // tables), so one cached reader is safe to share across threads. Keyed by
-    // lower-cased path + last-write-time so an archive rebuilt on disk re-scans.
-    std::mutex g_readerMutex;
-    struct CachedReader
-    {
-        std::shared_ptr<IArchiveReader> reader;
-        std::filesystem::file_time_type mtime {};
-    };
-    std::unordered_map<std::wstring, CachedReader> g_readerCache;
-    constexpr size_t kMaxCachedReaders = 16; // browsing touches only a few at once
-
     std::shared_ptr<IArchiveReader> GetCachedReader(const std::filesystem::path& archivePath)
     {
-        std::error_code ec;
-        const auto mtime = std::filesystem::last_write_time(archivePath, ec);
-        const std::wstring key = StringUtil::ToLower(archivePath.wstring());
-
-        std::lock_guard<std::mutex> lk(g_readerMutex);
-        if (auto it = g_readerCache.find(key); it != g_readerCache.end())
-        {
-            // Reuse unless the file changed on disk. If the mtime is unavailable
-            // (ec), trust the cached reader for the session.
-            if (ec || it->second.mtime == mtime)
-            {
-                return it->second.reader;
-            }
-        }
-
-        std::shared_ptr<IArchiveReader> reader = ArchiveReaderFactory::Open(archivePath);
-        if (reader)
-        {
-            // Bound the cache: readers hold only file-table metadata (not file
-            // contents), but don't let a long browsing session grow unbounded.
-            if (g_readerCache.size() >= kMaxCachedReaders && g_readerCache.find(key) == g_readerCache.end())
-            {
-                g_readerCache.clear();
-            }
-            g_readerCache[key] = CachedReader{ reader, ec ? std::filesystem::file_time_type{} : mtime };
-        }
-        return reader;
+        return ArchiveReaderCache::Shared().Get(archivePath);
     }
 }
 
@@ -155,32 +102,8 @@ bool VirtualFileSystem::IsDirectory(const VirtualPath& path)
     if (path.IsInArchive())
     {
         auto reader = GetCachedReader(path.hostPath);
-        if (!reader)
-        {
-            return false;
-        }
-
-        std::wstring normalized = NormalizePath(path.archiveInnerPath);
-        std::wstring searchPrefix = normalized;
-        if (!searchPrefix.empty() && searchPrefix.back() != L'/')
-        {
-            searchPrefix += L'/';
-        }
-
-        auto entries = reader->ListEntries();
-        for (const auto& entry : entries)
-        {
-            std::wstring entryNormalized = NormalizePath(entry.name);
-            if (entryNormalized == normalized && entry.isDirectory)
-            {
-                return true;
-            }
-            if (StartsWith(entryNormalized, searchPrefix))
-            {
-                return true;
-            }
-        }
-        return false;
+        // Directory index lookup: no scan or copy of the entry table.
+        return reader && reader->HasDirectory(path.archiveInnerPath);
     }
     else if (path.IsArchiveFile())
     {
@@ -188,7 +111,8 @@ bool VirtualFileSystem::IsDirectory(const VirtualPath& path)
     }
     else
     {
-        return std::filesystem::is_directory(path.hostPath);
+        std::error_code ec;
+        return std::filesystem::is_directory(path.hostPath, ec) && !ec;
     }
 }
 
@@ -248,22 +172,24 @@ std::vector<VirtualFileEntry> VirtualFileSystem::ListArchiveRoot(const std::file
         return entries;
     }
 
-    auto archiveEntries = reader->ListEntries();
-    std::unordered_set<std::wstring> addedDirs;
-
-    for (const auto& archEntry : archiveEntries)
+    std::unordered_set<std::wstring> addedDirs;   // ArchiveInnerPathKey
+    for (const auto& archEntry : reader->Entries())
     {
         std::wstring normalized = NormalizePath(archEntry.name);
         auto sepPos = normalized.find(L'/');
         if (sepPos == std::wstring::npos)
         {
+            if (archEntry.isDirectory && !addedDirs.insert(ArchiveInnerPathKey(normalized)).second)
+            {
+                continue;   // already listed as the parent of an entry
+            }
             VirtualPath vpath(archivePath, normalized);
             entries.emplace_back(vpath, archEntry.isDirectory, archEntry.size, archEntry.modTime);
         }
         else
         {
             std::wstring dirName = normalized.substr(0, sepPos);
-            if (addedDirs.insert(dirName).second)
+            if (addedDirs.insert(ArchiveInnerPathKey(dirName)).second)
             {
                 VirtualPath vpath(archivePath, dirName);
                 entries.emplace_back(vpath, true, 0, 0);
@@ -285,28 +211,30 @@ std::vector<VirtualFileEntry> VirtualFileSystem::ListArchiveSubdirectory(
     }
 
     std::wstring searchPrefix = NormalizePath(innerPath);
-    if (!searchPrefix.empty() && searchPrefix.back() != L'/')
+    if (!searchPrefix.empty())
     {
         searchPrefix += L'/';
     }
-    const std::wstring searchPrefixLower = StringUtil::ToLower(searchPrefix);
+    const std::wstring searchPrefixKey = StringUtil::ToLower(searchPrefix);
 
-    auto archiveEntries = reader->ListEntries();
-    std::unordered_set<std::wstring> addedDirs;
-
-    for (const auto& archEntry : archiveEntries)
+    std::unordered_set<std::wstring> addedDirs;   // ArchiveInnerPathKey
+    for (const auto& archEntry : reader->Entries())
     {
         std::wstring normalized = NormalizePath(archEntry.name);
-        const std::wstring normalizedLower = StringUtil::ToLower(normalized);
-        if (!StartsWith(normalizedLower, searchPrefixLower))
+        if (normalized.length() <= searchPrefix.length() ||
+            StringUtil::ToLower(normalized.substr(0, searchPrefix.length())) != searchPrefixKey)
         {
-            continue;
+            continue;   // outside this directory, or the directory entry itself
         }
 
         std::wstring relativePath = normalized.substr(searchPrefix.length());
         auto sepPos = relativePath.find(L'/');
         if (sepPos == std::wstring::npos)
         {
+            if (archEntry.isDirectory && !addedDirs.insert(ArchiveInnerPathKey(normalized)).second)
+            {
+                continue;   // already listed as the parent of an entry
+            }
             VirtualPath vpath(archivePath, normalized);
             entries.emplace_back(vpath, archEntry.isDirectory, archEntry.size, archEntry.modTime);
         }
@@ -314,7 +242,7 @@ std::vector<VirtualFileEntry> VirtualFileSystem::ListArchiveSubdirectory(
         {
             std::wstring dirName = relativePath.substr(0, sepPos);
             std::wstring fullDirPath = searchPrefix + dirName;
-            if (addedDirs.insert(fullDirPath).second)
+            if (addedDirs.insert(ArchiveInnerPathKey(fullDirPath)).second)
             {
                 VirtualPath vpath(archivePath, fullDirPath);
                 entries.emplace_back(vpath, true, 0, 0);
@@ -326,12 +254,6 @@ std::vector<VirtualFileEntry> VirtualFileSystem::ListArchiveSubdirectory(
 
 std::wstring VirtualFileSystem::NormalizePath(const std::wstring& path)
 {
-    std::wstring result = path;
-    std::replace(result.begin(), result.end(), L'\\', L'/');
-    while (!result.empty() && result.back() == L'/')
-    {
-        result.pop_back();
-    }
-    return result;
+    return NormalizeArchiveInnerPath(path);
 }
 }

@@ -1,10 +1,55 @@
 #include "VirtualPath.h"
 #include "ArchiveReader.h"
 #include "StringUtil.h"
+#include "VirtualFileSystem.h"
 #include <algorithm>
 
 namespace Floar
 {
+std::wstring NormalizeArchiveInnerPath(std::wstring path)
+{
+    std::wstring out;
+    out.reserve(path.size());
+    for (wchar_t ch : path)
+    {
+        if (ch == L'\\')
+        {
+            ch = L'/';
+        }
+        if (ch == L'/' && (out.empty() || out.back() == L'/'))
+        {
+            continue;  // leading or repeated separator
+        }
+        out.push_back(ch);
+    }
+    if (!out.empty() && out.back() == L'/')
+    {
+        out.pop_back();
+    }
+    return out;
+}
+
+std::wstring ArchiveInnerPathKey(const std::wstring& path)
+{
+    return StringUtil::ToLower(NormalizeArchiveInnerPath(path));
+}
+
+std::wstring HostPathKey(const std::filesystem::path& path)
+{
+    if (path.empty())
+    {
+        return {};
+    }
+    std::wstring text = path.lexically_normal().make_preferred().wstring();
+    // "C:\dir\" -> "C:\dir", but keep roots such as "C:\" or "\\".
+    const size_t rootLength = path.lexically_normal().make_preferred().root_path().wstring().size();
+    while (text.size() > rootLength && (text.back() == L'\\' || text.back() == L'/'))
+    {
+        text.pop_back();
+    }
+    return StringUtil::ToLower(std::move(text));
+}
+
 bool VirtualPath::IsArchiveFile() const
 {
     if (IsInArchive())
@@ -40,19 +85,7 @@ VirtualPath VirtualPath::GetParent() const
 
 bool VirtualPath::Exists() const
 {
-    if (IsInArchive())
-    {
-        auto reader = ArchiveReaderFactory::Open(hostPath);
-        if (!reader)
-        {
-            return false;
-        }
-        return reader->HasEntry(archiveInnerPath);
-    }
-    else
-    {
-        return std::filesystem::exists(hostPath);
-    }
+    return VirtualFileSystem::Exists(*this);
 }
 
 std::optional<VirtualPath> VirtualPath::Parse(const std::wstring& displayPath)
@@ -75,9 +108,8 @@ std::optional<VirtualPath> VirtualPath::Parse(const std::wstring& displayPath)
                 (displayPath[afterExt] == L'\\' || displayPath[afterExt] == L'/'))
             {
                 std::wstring archivePart = displayPath.substr(0, afterExt);
-                std::wstring innerPart = displayPath.substr(afterExt + 1);
-                std::replace(innerPart.begin(), innerPart.end(), L'\\', L'/');
-                return VirtualPath(archivePart, innerPart);
+                // The constructor normalizes the inner part.
+                return VirtualPath(archivePart, displayPath.substr(afterExt + 1));
             }
             pos = lowerPath.find(ext, pos + 1);
         }
