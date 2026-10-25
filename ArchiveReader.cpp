@@ -1945,7 +1945,13 @@ bool IArchiveReader::ExtractBatch(const std::vector<std::wstring>& entryPaths, s
         {
             return false;
         }
-        onEntry(entryPath, ExtractToMemory(entryPath));
+        std::vector<uint8_t> data = ExtractToMemory(entryPath);
+        // A stop requested while the entry was read suppresses its delivery.
+        if (stop.stop_requested())
+        {
+            return false;
+        }
+        onEntry(entryPath, std::move(data));
     }
     return !stop.stop_requested();
 }

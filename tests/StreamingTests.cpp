@@ -143,6 +143,36 @@ FLOAR_TEST(StreamEnumerate_ArchiveCompletesAndStopsBetweenEntries)
     FLOAR_CHECK(count == 1);
 }
 
+FLOAR_TEST(StreamEnumerate_StopFromTheLastEntryIsReported)
+{
+    ScopedDir dir { TempDir(L"last") };
+    const auto zip = dir.path / L"single.zip";
+    FLOAR_REQUIRE(FloarTest::WriteZip(zip, { { L"only.txt", "1" } }, {}));
+    const auto folder = dir.path / L"folder";
+    std::filesystem::create_directories(folder);
+    std::ofstream(folder / L"only.txt") << 1;
+
+    // One archive entry whose callback stops: not a completed listing.
+    std::stop_source archiveStop;
+    int calls = 0;
+    FLOAR_CHECK(!VirtualFileSystem::EnumerateDirectory(VirtualPath(zip), archiveStop.get_token(), [&](VirtualFileEntry&&)
+    {
+        ++calls;
+        archiveStop.request_stop();
+    }));
+    FLOAR_CHECK(calls == 1);
+
+    // The same for a folder with a single file.
+    std::stop_source folderStop;
+    calls = 0;
+    FLOAR_CHECK(!VirtualFileSystem::EnumerateDirectory(VirtualPath(folder), folderStop.get_token(), [&](VirtualFileEntry&&)
+    {
+        ++calls;
+        folderStop.request_stop();
+    }));
+    FLOAR_CHECK(calls == 1);
+}
+
 FLOAR_TEST(StreamEnumerate_InterruptedOpenReturnsAndCachesNothing)
 {
     ScopedDir dir { TempDir(L"open") };
@@ -341,6 +371,47 @@ FLOAR_TEST(StreamBatch_ThrowingCallbackReleasesTheArchive)
     FLOAR_CHECK(std::filesystem::remove(fixture.zip, ec) && !ec);
     // The reader keeps no batch state.
     FLOAR_CHECK(reader->Entries().size() == 6);
+}
+
+namespace
+{
+    // A random-access reader (default ExtractBatch) whose extraction is where
+    // the stop arrives.
+    class StopDuringExtractReader final : public IArchiveReader
+    {
+    public:
+        explicit StopDuringExtractReader(std::stop_source& stop)
+            : m_stop(stop)
+        {
+        }
+
+        const std::vector<ArchiveEntry>& Entries() const override { return m_entries; }
+        std::vector<uint8_t> ExtractToMemory(const std::wstring&) override
+        {
+            ++extractions;
+            m_stop.request_stop();
+            return { 1, 2, 3 };
+        }
+        bool HasEntry(const std::wstring&) override { return true; }
+        bool HasDirectory(const std::wstring&) const override { return false; }
+        std::wstring GetFormatName() const override { return L"stop"; }
+
+        int extractions { 0 };
+
+    private:
+        std::stop_source& m_stop;
+        std::vector<ArchiveEntry> m_entries {};
+    };
+}
+
+FLOAR_TEST(StreamBatch_RandomAccessStopDuringExtractionDeliversNothing)
+{
+    std::stop_source stop;
+    StopDuringExtractReader reader(stop);
+    int calls = 0;
+    FLOAR_CHECK(!reader.ExtractBatch({ L"a.dds", L"b.dds" }, stop.get_token(), [&](const std::wstring&, std::vector<uint8_t>&&) { ++calls; }));
+    FLOAR_CHECK(calls == 0);
+    FLOAR_CHECK(reader.extractions == 1);
 }
 
 FLOAR_TEST(StreamBatch_ConcurrentReadersShareOneReader)

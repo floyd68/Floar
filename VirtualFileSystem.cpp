@@ -255,7 +255,8 @@ bool VirtualFileSystem::EnumerateArchive(
             }
         }
     }
-    return true;
+    // The last callback may have requested stop.
+    return !stop.stop_requested();
 }
 
 std::wstring VirtualFileSystem::NormalizePath(const std::wstring& path)
