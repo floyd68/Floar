@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <set>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -130,7 +131,7 @@ namespace
                 ++m_concurrent;
                 m_maxConcurrent = (std::max)(m_maxConcurrent, m_concurrent);
                 m_changed.notify_all();
-                const auto released = [&] { return m_released[name] > 0 || m_releaseAll; };
+                const auto released = [&] { return m_released[name] > 0 || m_releaseAll || m_releasedCalls.count(index) != 0; };
                 if (honorStop)
                 {
                     (void)m_changed.wait(lock, stop, released);
@@ -140,7 +141,7 @@ namespace
                     m_changed.wait(lock, released);
                 }
                 const bool stopped = stop.stop_requested();
-                if (!stopped && m_released[name] > 0)
+                if (!stopped && m_releasedCalls.count(index) == 0 && m_released[name] > 0)
                 {
                     --m_released[name];
                 }
@@ -160,6 +161,14 @@ namespace
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             ++m_released[name];
+            m_changed.notify_all();
+        }
+
+        // Releases one call (by its index in Calls()).
+        void ReleaseCall(size_t index)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_releasedCalls.insert(index);
             m_changed.notify_all();
         }
 
@@ -199,6 +208,7 @@ namespace
         std::condition_variable_any m_changed {};
         std::vector<Call> m_calls {};
         std::map<std::wstring, int> m_released {};
+        std::set<size_t> m_releasedCalls {};
         bool m_releaseAll { false };
         size_t m_concurrent { 0 };
         size_t m_maxConcurrent { 0 };
@@ -760,4 +770,37 @@ FLOAR_TEST(Pool_BlockedOsReadIsCancelledAtShutdown)
     FLOAR_REQUIRE(Ready(caller));
     FLOAR_CHECK(caller.get() == nullptr);
     FLOAR_CHECK(cache.WorkerCount() == 0);
+}
+
+FLOAR_TEST(Pool_ReplacedArchiveGetsItsOwnOpenAndTheNewestReaderIsCached)
+{
+    ScopedDir dir { TempDir(L"replace") };
+    const auto a = dir.File(L"a.zip");
+    GatedOpener opener;
+    ArchiveReaderCache cache(4, opener.Make(), 2);
+
+    auto callerOld = GetAsync(cache, a);
+    FLOAR_REQUIRE(opener.WaitCalls(1));
+    // The file is replaced while the first open still scans the old one.
+    std::ofstream(a, std::ios::binary | std::ios::trunc) << "replaced";
+    auto callerNew = GetAsync(cache, a);
+    // A second open for the new identity, not a join of the old one.
+    FLOAR_REQUIRE(opener.WaitCalls(2));
+    FLOAR_CHECK(cache.RunningOpenCount() == 2);
+
+    opener.ReleaseCall(1);
+    FLOAR_REQUIRE(Ready(callerNew));
+    const auto newReader = callerNew.get();
+    FLOAR_CHECK(Generation(newReader) == 2);
+    FLOAR_CHECK(cache.Get(a) == newReader);
+
+    // The old open was not stopped and still serves its own caller...
+    opener.ReleaseCall(0);
+    FLOAR_REQUIRE(Ready(callerOld));
+    FLOAR_CHECK(Generation(callerOld.get()) == 1);
+    FLOAR_CHECK(!opener.Calls()[0].stopSeen);
+    // ...but finishing last does not replace the newer cached reader.
+    FLOAR_CHECK(cache.Get(a) == newReader);
+    FLOAR_CHECK(cache.OpenCount() == 2);
+    FLOAR_CHECK(cache.Shutdown(5s));
 }

@@ -113,16 +113,25 @@ std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::p
     }
     else if (!stop.stop_requested())
     {
-        // Join the archive's queued or running open, or queue a new one.
-        std::shared_ptr<Operation> operation = slot->current;
+        // Join the newest queued or running open of this file identity, or
+        // queue a new one: a replaced file never gets an older generation.
+        std::shared_ptr<Operation> operation;
+        for (const auto& open : slot->opens)
+        {
+            if (!identity.known || open->identity == identity)
+            {
+                operation = open;
+            }
+        }
         if (!operation)
         {
             operation = std::make_shared<Operation>();
             operation->path = path;
             operation->identity = identity;
+            operation->generation = ++slot->nextGeneration;
             operation->slot = slot;
             operation->queued = true;
-            slot->current = operation;
+            slot->opens.push_back(operation);
             m_queue.push_back(operation);
             StartWorkerIfNeededLocked();
             m_workAvailable.notify_one();
@@ -146,7 +155,7 @@ std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::p
 
     --slot->activeLookups;
     // Do not let unopenable paths occupy capacity.
-    if (!slot->reader && !slot->current && slot->activeLookups == 0)
+    if (!slot->reader && slot->opens.empty() && slot->activeLookups == 0)
     {
         if (auto it = m_nodes.find(key); it != m_nodes.end() && it->second.slot == slot)
         {
@@ -180,10 +189,7 @@ void ArchiveReaderCache::RetireLocked(const std::shared_ptr<Operation>& operatio
         (void)CancelSynchronousIo(static_cast<HANDLE>(operation->worker->handle));
     }
     // A later caller starts a replacement operation instead of joining this one.
-    if (operation->slot->current == operation)
-    {
-        operation->slot->current.reset();
-    }
+    std::erase(operation->slot->opens, operation);
     operation->finished.notify_all();
 }
 
@@ -269,12 +275,14 @@ void ArchiveReaderCache::WorkerMain(Worker* self)
         operation->done = true;
         operation->reader = reader;
         Slot& slot = *operation->slot;
-        slot.reader = reader;
-        slot.identity = operation->identity;
-        if (slot.current == operation)
+        // An older generation finishing late never replaces a newer one.
+        if (operation->generation > slot.publishedGeneration)
         {
-            slot.current.reset();
+            slot.reader = reader;
+            slot.identity = operation->identity;
+            slot.publishedGeneration = operation->generation;
         }
+        std::erase(slot.opens, operation);
         operation->finished.notify_all();
     }
 

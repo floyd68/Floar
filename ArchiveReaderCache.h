@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace Floar
 {
@@ -37,13 +38,16 @@ namespace Floar
 //   cache (never on a caller's thread), at most `maxOpenWorkers` at once, one
 //   operation per worker. Workers start lazily, when the first open needs one,
 //   and live until Shutdown. Callers of an archive whose open is queued or
-//   running register interest in that operation instead of opening it again,
-//   and wait on their own `stop` token: a stopped caller leaves at once without
-//   stopping the open. The operation owns its stop_source and is stopped only
-//   when its last interested caller left (it is then retired: it publishes
-//   nothing, and a caller arriving afterwards starts a replacement operation
-//   instead of joining the stopped one) or at Shutdown. Stopping also calls a
-//   best-effort CancelSynchronousIo on the worker running it; that call is made
+//   running for the same file identity register interest in that operation
+//   instead of opening it again, and wait on their own `stop` token: a stopped
+//   caller leaves at once without stopping the open. A caller that sees a
+//   different identity (the file was replaced while it was being opened) gets
+//   an operation of its own; the older one still serves its own callers, and
+//   the newest finished generation is the one cached. The operation owns its
+//   stop_source and is stopped only when its last interested caller left (it
+//   is then retired: it publishes nothing, and a caller arriving afterwards
+//   starts a replacement operation instead of joining the stopped one) or at
+//   Shutdown. Stopping also calls a best-effort CancelSynchronousIo on the worker running it; that call is made
 //   under the cache lock while the worker is assigned to that operation, so it
 //   never reaches the worker's next open. Not every OS call honours it.
 // - Admission: one FIFO queue, one priority, shared by callers with and
@@ -131,7 +135,9 @@ private:
     {
         std::shared_ptr<IArchiveReader> reader {};
         Identity identity {};
-        std::shared_ptr<Operation> current {};  // queued or running, not retired
+        std::vector<std::shared_ptr<Operation>> opens {};  // queued or running, not retired
+        std::uint64_t nextGeneration { 0 };
+        std::uint64_t publishedGeneration { 0 };            // of `reader`
         size_t activeLookups { 0 };
     };
 
@@ -140,6 +146,7 @@ private:
     {
         std::filesystem::path path {};
         Identity identity {};
+        std::uint64_t generation { 0 };    // per slot, increasing
         std::shared_ptr<Slot> slot {};
         std::stop_source stop {};          // service-owned
         std::condition_variable_any finished {};
