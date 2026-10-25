@@ -33,12 +33,14 @@ public:
 
     // Streams the children of `dirPath` (a folder, an archive, or a folder in
     // an archive) to `onEntry`. `stop` is checked before every file-system
-    // operation, before an archive is opened (a scan in progress also stops,
-    // and its partial reader is discarded) and between entries. Returns false
-    // once stopped; true when the listing completed, including folders that do
-    // not exist or archives that cannot be opened (no entries). Runs entirely on
-    // the calling thread: `onEntry` is never called after the call returns and
-    // no cache lock is held while it runs.
+    // operation, before an archive is opened, while waiting for the open (the
+    // scan itself stops only once no other caller waits for it; a stopped scan
+    // publishes no reader) and between entries. Returns false once stopped;
+    // true when the listing completed, including folders that do not exist or
+    // archives that cannot be opened (no entries). Runs on the calling thread,
+    // except the archive open (on an ArchiveReaderCache worker): `onEntry` is
+    // never called after the call returns and no cache lock is held while it
+    // runs.
     static bool EnumerateDirectory(
         const VirtualPath& dirPath,
         std::stop_token stop,

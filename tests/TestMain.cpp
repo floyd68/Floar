@@ -1,6 +1,10 @@
 #include "TestHarness.h"
 
+#include "ArchiveReaderCache.h"
+
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 
@@ -92,6 +96,13 @@ int main(int argc, char** argv)
     for (const auto& teardown : Teardowns())
     {
         teardown();
+    }
+    // The shared cache's open workers must not reach static teardown.
+    if (!Floar::ArchiveReaderCache::Shared().Shutdown(std::chrono::seconds(10)))
+    {
+        std::fprintf(stderr, "ArchiveReaderCache::Shared() workers did not stop\n");
+        std::fflush(nullptr);
+        std::_Exit(1);
     }
 
     std::printf("%d test(s) run, %d failed\n", run, failedTests);
