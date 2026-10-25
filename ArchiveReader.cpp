@@ -58,6 +58,8 @@ namespace
 {
     constexpr int kZlibOk = 0;
     constexpr uint32_t kMaxBa2InflateBytes = 1024u * 1024u * 1024u;
+    // Upper bound for one assembled DX10 texture (header + all chunks).
+    constexpr uint64_t kMaxBa2Dx10Bytes = 2ull * 1024ull * 1024ull * 1024ull;
 
     std::wstring Utf8ToWide(const char* utf8Str)
     {
@@ -196,6 +198,7 @@ namespace
 
     std::atomic<size_t> g_statusQueries { 0 };
     std::atomic<size_t> g_opens { 0 };
+    std::atomic<size_t> g_dataHandleOpens { 0 };
 
     std::wstring ExtensionFromFourCC(const char(&ext)[4])
     {
@@ -302,35 +305,38 @@ namespace
         return 0;
     }
 
-    std::vector<uint8_t> DecompressZlibRaw(
-        const std::vector<uint8_t>& compressed,
+    // Raw-deflate `compressed` into out[0, expectedSize); returns the bytes
+    // written (0 on failure).
+    size_t DecompressZlibRawInto(
+        const uint8_t* compressed,
+        size_t compressedSize,
+        uint8_t* out,
         uint32_t expectedSize)
     {
 #if !FLOAR_HAS_ZLIB
         (void)compressed;
+        (void)compressedSize;
+        (void)out;
         (void)expectedSize;
-        return {};
+        return 0;
 #else
-        std::vector<uint8_t> output;
-        if (compressed.empty() || expectedSize == 0 || expectedSize > kMaxBa2InflateBytes)
+        if (compressedSize == 0 || expectedSize == 0 || expectedSize > kMaxBa2InflateBytes)
         {
             FLOAR_LOG_WARN("[BA2] Raw inflate skipped: invalid sizes.");
-            return output;
+            return 0;
         }
 
-        output.resize(expectedSize);
         z_stream stream {};
-        stream.next_in = const_cast<Bytef*>(compressed.data());
-        stream.avail_in = static_cast<uInt>(compressed.size());
-        stream.next_out = output.data();
-        stream.avail_out = static_cast<uInt>(output.size());
+        stream.next_in = const_cast<Bytef*>(compressed);
+        stream.avail_in = static_cast<uInt>(compressedSize);
+        stream.next_out = out;
+        stream.avail_out = static_cast<uInt>(expectedSize);
 
         const int initResult = inflateInit2(&stream, -MAX_WBITS);
         if (initResult != Z_OK)
         {
             FLOAR_LOG_WARN("[BA2] Raw inflate init failed.");
-            output.clear();
-            return output;
+            return 0;
         }
 
         const int inflateResult = inflate(&stream, Z_FINISH);
@@ -339,48 +345,62 @@ namespace
         if (inflateResult != Z_STREAM_END || stream.total_out == 0 || stream.total_out > expectedSize)
         {
             FLOAR_LOG_WARN("[BA2] Raw inflate failed or size mismatch.");
-            output.clear();
-            return output;
+            return 0;
         }
 
-        output.resize(stream.total_out);
-        return output;
+        return static_cast<size_t>(stream.total_out);
 #endif
+    }
+
+    // Inflates zlib (or, failing that, raw deflate) data into
+    // out[0, expectedSize); returns the bytes written (0 on failure).
+    size_t DecompressZlibInto(
+        const uint8_t* compressed,
+        size_t compressedSize,
+        uint8_t* out,
+        uint32_t expectedSize)
+    {
+        if (compressedSize == 0 || expectedSize == 0 || expectedSize > kMaxBa2InflateBytes)
+        {
+            FLOAR_LOG_WARN("[BA2] Zlib inflate skipped: invalid sizes.");
+            return 0;
+        }
+
+        uLongf outSize = expectedSize;
+        const int result = uncompress(
+            out,
+            &outSize,
+            compressed,
+            static_cast<uLong>(compressedSize));
+        if (result == kZlibOk && outSize > 0 && outSize <= expectedSize)
+        {
+            return static_cast<size_t>(outSize);
+        }
+
+        FLOAR_LOG_WARN("[BA2] Zlib inflate failed, trying raw deflate.");
+        const size_t raw = DecompressZlibRawInto(compressed, compressedSize, out, expectedSize);
+        if (raw != 0)
+        {
+            return raw;
+        }
+
+        FLOAR_LOG_WARN("[BA2] Raw deflate also failed.");
+        return 0;
     }
 
     std::vector<uint8_t> DecompressZlib(
         const std::vector<uint8_t>& compressed,
         uint32_t expectedSize)
     {
-        std::vector<uint8_t> output;
         if (compressed.empty() || expectedSize == 0 || expectedSize > kMaxBa2InflateBytes)
         {
             FLOAR_LOG_WARN("[BA2] Zlib inflate skipped: invalid sizes.");
-            return output;
+            return {};
         }
 
-        output.resize(expectedSize);
-        uLongf outSize = expectedSize;
-        const int result = uncompress(
-            output.data(),
-            &outSize,
-            compressed.data(),
-            static_cast<uLong>(compressed.size()));
-        if (result == kZlibOk && outSize > 0 && outSize <= expectedSize)
-        {
-            output.resize(outSize);
-            return output;
-        }
-
-        FLOAR_LOG_WARN("[BA2] Zlib inflate failed, trying raw deflate.");
-        auto raw = DecompressZlibRaw(compressed, expectedSize);
-        if (!raw.empty())
-        {
-            return raw;
-        }
-
-        FLOAR_LOG_WARN("[BA2] Raw deflate also failed.");
-        return {};
+        std::vector<uint8_t> output(expectedSize);
+        output.resize(DecompressZlibInto(compressed.data(), compressed.size(), output.data(), expectedSize));
+        return output;
     }
 
     // Skyrim SE v105 BSAs store their compressed payloads in the LZ4 FRAME
@@ -640,12 +660,18 @@ public:
 private:
     bool ReadAt(uint64_t offset, void* data, size_t size) const
     {
+        ++g_dataHandleOpens;
         std::ifstream stream(m_path, std::ios::binary);
         if (!stream)
         {
             return false;
         }
+        return ReadAt(stream, offset, data, size);
+    }
 
+    static bool ReadAt(std::ifstream& stream, uint64_t offset, void* data, size_t size)
+    {
+        stream.clear();
         stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
         if (!stream.good())
         {
@@ -706,57 +732,88 @@ private:
         return data;
     }
 
+    // One stream serves every chunk. Space for the DDS header is reserved in
+    // front of the payload and each chunk is read or inflated straight into its
+    // place, so the payload is never copied (per chunk or to prepend the
+    // header). Output is byte-identical to concatenating the chunks behind the
+    // header; a payload that already starts with "DDS " is returned as is.
     std::vector<uint8_t> ExtractDx10(const Ba2FileInfo& info) const
     {
-        std::vector<uint8_t> result;
-        if (info.unpackedSize > 0)
-        {
-            result.reserve(info.unpackedSize);
-        }
+        const std::vector<uint8_t> header = BuildDdsHeader(info.width, info.height, info.mipCount, info.format);
+
+        // Stored chunks hold exactly unpackedSize bytes; compressed ones inflate
+        // to at most that.
+        uint64_t capacity = header.size();
         for (const auto& chunk : info.chunks)
         {
-            if (chunk.packedSize != 0 && chunk.packedSize != chunk.unpackedSize)
-            {
-                const auto compressed = ReadRange(chunk.offset, chunk.packedSize);
-                if (compressed.empty())
-                {
-                    FLOAR_LOG_WARN("[BA2] DX10 failed to read compressed chunk.");
-                    return {};
-                }
-                auto decompressed = DecompressZlib(compressed, chunk.unpackedSize);
-                if (decompressed.empty())
-                {
-                    FLOAR_LOG_WARN("[BA2] DX10 chunk decompression failed.");
-                    return {};
-                }
-                result.insert(result.end(), decompressed.begin(), decompressed.end());
-                continue;
-            }
+            capacity += chunk.unpackedSize;
+        }
+        if (capacity > kMaxBa2Dx10Bytes)
+        {
+            FLOAR_LOG_WARN("[BA2] DX10 entry too large.");
+            return {};
+        }
 
-            const size_t readSize = (chunk.packedSize != 0) ? chunk.packedSize : chunk.unpackedSize;
-            auto chunkData = ReadRange(chunk.offset, readSize);
-            if (chunkData.empty())
+        std::vector<uint8_t> result(static_cast<size_t>(capacity));
+        size_t cursor = header.size();
+        if (!info.chunks.empty())
+        {
+            ++g_dataHandleOpens;
+            std::ifstream stream(m_path, std::ios::binary);
+            if (!stream)
             {
                 FLOAR_LOG_WARN("[BA2] DX10 failed to read chunk data.");
                 return {};
             }
-            result.insert(result.end(), chunkData.begin(), chunkData.end());
-        }
 
-        if (result.size() >= 4 && result[0] == 'D' && result[1] == 'D' && result[2] == 'S' && result[3] == ' ')
+            std::vector<uint8_t> compressed;   // reused for every compressed chunk
+            for (const auto& chunk : info.chunks)
+            {
+                if (chunk.packedSize != 0 && chunk.packedSize != chunk.unpackedSize)
+                {
+                    compressed.resize(chunk.packedSize);
+                    if (!ReadAt(stream, chunk.offset, compressed.data(), compressed.size()))
+                    {
+                        FLOAR_LOG_WARN("[BA2] DX10 failed to read compressed chunk.");
+                        return {};
+                    }
+                    const size_t written = DecompressZlibInto(compressed.data(), compressed.size(), result.data() + cursor, chunk.unpackedSize);
+                    if (written == 0)
+                    {
+                        FLOAR_LOG_WARN("[BA2] DX10 chunk decompression failed.");
+                        return {};
+                    }
+                    cursor += written;
+                    continue;
+                }
+
+                const size_t readSize = (chunk.packedSize != 0) ? chunk.packedSize : chunk.unpackedSize;
+                if (readSize == 0 || !ReadAt(stream, chunk.offset, result.data() + cursor, readSize))
+                {
+                    FLOAR_LOG_WARN("[BA2] DX10 failed to read chunk data.");
+                    return {};
+                }
+                cursor += readSize;
+            }
+        }
+        result.resize(cursor);
+
+        const uint8_t* payload = result.data() + header.size();
+        const size_t payloadSize = result.size() - header.size();
+        if (payloadSize >= 4 && payload[0] == 'D' && payload[1] == 'D' && payload[2] == 'S' && payload[3] == ' ')
         {
+            result.erase(result.begin(), result.begin() + static_cast<std::ptrdiff_t>(header.size()));
             return result;
         }
 
-        auto header = BuildDdsHeader(info.width, info.height, info.mipCount, info.format);
         if (header.empty())
         {
             FLOAR_LOG_WARN("[BA2] DX10 failed to build DDS header.");
             return {};
         }
 
-        header.insert(header.end(), result.begin(), result.end());
-        return header;
+        std::memcpy(result.data(), header.data(), header.size());
+        return result;
     }
 
     std::vector<uint8_t> BuildDdsHeader(uint16_t width, uint16_t height, uint8_t mipCount, DXGI_FORMAT format) const
@@ -1533,11 +1590,11 @@ class LibArchiveReader : public IArchiveReader
     std::wstring m_formatName;
 
 public:
-    LibArchiveReader(const std::filesystem::path& path)
+    LibArchiveReader(const std::filesystem::path& path, std::stop_token stop)
         : m_path(path)
     {
         FLOAR_LOG_INFO("[LibArchiveReader] Opening: {}", Log::ToUtf8(path));
-        ScanArchive();
+        ScanArchive(stop);
         FLOAR_LOG_INFO("[LibArchiveReader] Scanned, found {} entries", m_entries.size());
     }
 
@@ -1555,127 +1612,103 @@ public:
     {
         FLOAR_LOG_DEBUG("[LibArchiveReader] ExtractToMemory: {}", Log::ToUtf8(entryPath));
 
-        auto it = m_entryMap.find(ArchiveInnerPathKey(entryPath));
-        if (it == m_entryMap.end())
-        {
-            FLOAR_LOG_WARN("[LibArchiveReader] Entry not found in map");
-            return {};
-        }
-
-        const ArchiveEntry& entry = m_entries[it->second];
-        if (entry.isDirectory)
-        {
-            return {};
-        }
-
-        // Open archive for extraction
-        struct archive* a = archive_read_new();
-        if (!a)
-        {
-            return {};
-        }
-
-#if FLOAR_ENABLE_COMMON_ARCHIVES
-        // Enable only the formats we need
-        archive_read_support_format_zip(a);
-        archive_read_support_format_7zip(a);
-        archive_read_support_format_rar(a);
-        archive_read_support_format_rar5(a);
-
-        // Enable only essential compression filters for ZIP/7z/RAR
-        archive_read_support_filter_none(a);    // Uncompressed
-        archive_read_support_filter_gzip(a);    // ZIP deflate/gzip
-        archive_read_support_filter_lzma(a);    // 7z LZMA
-        archive_read_support_filter_xz(a);      // 7z XZ
-#endif
-
-        // Wide open: libarchive reads a narrow path in the active code page on
-        // Windows, which cannot name files outside it.
-        int r = archive_read_open_filename_w(a, m_path.c_str(), 10240);
-        if (r != ARCHIVE_OK)
-        {
-            archive_read_free(a);
-            return {};
-        }
-
         std::vector<uint8_t> result;
-        struct archive_entry* archiveEntry;
-        // Use the original entry name (with correct case) from m_entries
-        std::string targetUtf8 = WideToUtf8(entry.name);
-
-        while (archive_read_next_header(a, &archiveEntry) == ARCHIVE_OK)
+        (void)ExtractBatch({ entryPath }, std::stop_token {}, [&](const std::wstring&, std::vector<uint8_t>&& data)
         {
-            // UTF-8 view, independent of the CRT locale (see ScanArchive).
-            const char* name = archive_entry_pathname_utf8(archiveEntry);
-            if (!name)
-                continue;
+            result = std::move(data);
+        });
+        return result;
+    }
 
-            if (std::string(name) == targetUtf8)
+    // One sequential scan for the whole batch: entries are matched by their
+    // original names and read as the scan reaches them; the scan ends once every
+    // requested entry was found.
+    bool ExtractBatch(const std::vector<std::wstring>& entryPaths, std::stop_token stop, const BatchSink& onEntry) override
+    {
+        std::vector<bool> delivered(entryPaths.size(), false);
+        // Original (UTF-8) entry name -> indexes of the requests naming it.
+        std::unordered_map<std::string, std::vector<size_t>> wanted;
+        for (size_t i = 0; i < entryPaths.size(); ++i)
+        {
+            auto it = m_entryMap.find(ArchiveInnerPathKey(entryPaths[i]));
+            if (it == m_entryMap.end() || m_entries[it->second].isDirectory)
             {
-                // Found the entry, extract it
-                la_int64_t size = archive_entry_size(archiveEntry);
-
-                if (size > 0 && size < 1024 * 1024 * 1024) // Max 1GB
+                if (it == m_entryMap.end())
                 {
-                    result.resize(static_cast<size_t>(size));
-                    size_t totalRead = 0;
-                    while (totalRead < result.size())
+                    FLOAR_LOG_WARN("[LibArchiveReader] Entry not found in map");
+                }
+                continue;   // delivered empty below
+            }
+            wanted[WideToUtf8(m_entries[it->second].name)].push_back(i);
+        }
+
+        if (!wanted.empty() && !stop.stop_requested())
+        {
+            // Owned: freed even when a callback throws.
+            const ArchiveHandle handle = OpenForReading();
+            if (handle)
+            {
+                struct archive* a = handle.get();
+                struct archive_entry* archiveEntry;
+                while (!wanted.empty())
+                {
+                    if (stop.stop_requested())
                     {
-                        la_ssize_t chunkRead = archive_read_data(
-                            a,
-                            result.data() + totalRead,
-                            result.size() - totalRead);
-                        if (chunkRead <= 0)
-                        {
-                            break;
-                        }
-                        totalRead += static_cast<size_t>(chunkRead);
+                        break;   // entry boundary
+                    }
+                    if (archive_read_next_header(a, &archiveEntry) != ARCHIVE_OK)
+                    {
+                        break;
+                    }
+                    // UTF-8 view, independent of the CRT locale (see ScanArchive).
+                    const char* name = archive_entry_pathname_utf8(archiveEntry);
+                    if (!name)
+                    {
+                        continue;
+                    }
+                    auto found = wanted.find(name);
+                    if (found == wanted.end())
+                    {
+                        continue;
                     }
 
-                    if (totalRead != result.size())
+                    std::vector<uint8_t> data = ReadCurrentEntry(a, archiveEntry);
+                    const std::vector<size_t> requests = std::move(found->second);
+                    wanted.erase(found);
+                    for (size_t k = 0; k < requests.size(); ++k)
                     {
-                        result.clear();
+                        if (stop.stop_requested())
+                        {
+                            break;   // also between aliases of one entry
+                        }
+                        const size_t index = requests[k];
+                        delivered[index] = true;
+                        if (k + 1 == requests.size())
+                        {
+                            onEntry(entryPaths[index], std::move(data));
+                        }
+                        else
+                        {
+                            onEntry(entryPaths[index], std::vector<uint8_t>(data));
+                        }
                     }
                 }
-                else if (size < 0)
-                {
-                    // Some archive entries report unknown size. Read as a stream.
-                    constexpr size_t kReadChunk = 64 * 1024;
-                    std::vector<uint8_t> streamBuf(kReadChunk);
-                    size_t totalRead = 0;
-
-                    while (true)
-                    {
-                        la_ssize_t chunkRead = archive_read_data(a, streamBuf.data(), streamBuf.size());
-                        if (chunkRead == 0)
-                        {
-                            break;
-                        }
-                        if (chunkRead < 0)
-                        {
-                            result.clear();
-                            break;
-                        }
-
-                        totalRead += static_cast<size_t>(chunkRead);
-                        if (totalRead > 1024ull * 1024ull * 1024ull)
-                        {
-                            result.clear();
-                            break;
-                        }
-
-                        result.insert(
-                            result.end(),
-                            streamBuf.begin(),
-                            streamBuf.begin() + static_cast<std::ptrdiff_t>(chunkRead));
-                    }
-                }
-                break;
             }
         }
 
-        archive_read_free(a);
-        return result;
+        // Missing, directory, or not reached by the scan: empty data.
+        for (size_t i = 0; i < entryPaths.size(); ++i)
+        {
+            if (stop.stop_requested())
+            {
+                return false;
+            }
+            if (!delivered[i])
+            {
+                onEntry(entryPaths[i], {});
+            }
+        }
+        return !stop.stop_requested();
     }
 
     bool HasEntry(const std::wstring& entryPath) override
@@ -1689,7 +1722,113 @@ public:
     }
 
 private:
-    void ScanArchive()
+    struct ArchiveFree
+    {
+        void operator()(struct archive* a) const noexcept
+        {
+            archive_read_free(a);
+        }
+    };
+    using ArchiveHandle = std::unique_ptr<struct archive, ArchiveFree>;
+
+    // A libarchive handle positioned before the first header (null on failure).
+    ArchiveHandle OpenForReading() const
+    {
+        ArchiveHandle handle(archive_read_new());
+        struct archive* a = handle.get();
+        if (!a)
+        {
+            return nullptr;
+        }
+
+        // Enable only the formats we need
+        archive_read_support_format_zip(a);
+        archive_read_support_format_7zip(a);
+        archive_read_support_format_rar(a);
+        archive_read_support_format_rar5(a);
+
+        // Enable only essential compression filters for ZIP/7z/RAR
+        archive_read_support_filter_none(a);    // Uncompressed
+        archive_read_support_filter_gzip(a);    // ZIP deflate/gzip
+        archive_read_support_filter_lzma(a);    // 7z LZMA
+        archive_read_support_filter_xz(a);      // 7z XZ
+
+        ++g_dataHandleOpens;
+        // Wide open: libarchive reads a narrow path in the active code page on
+        // Windows, which cannot name files outside it.
+        if (archive_read_open_filename_w(a, m_path.c_str(), 10240) != ARCHIVE_OK)
+        {
+            return nullptr;
+        }
+        return handle;
+    }
+
+    // Reads the data of the entry whose header was just read (empty on
+    // failure or for entries over 1 GB).
+    static std::vector<uint8_t> ReadCurrentEntry(struct archive* a, struct archive_entry* archiveEntry)
+    {
+        std::vector<uint8_t> result;
+        la_int64_t size = archive_entry_size(archiveEntry);
+
+        if (size > 0 && size < 1024 * 1024 * 1024) // Max 1GB
+        {
+            result.resize(static_cast<size_t>(size));
+            size_t totalRead = 0;
+            while (totalRead < result.size())
+            {
+                la_ssize_t chunkRead = archive_read_data(
+                    a,
+                    result.data() + totalRead,
+                    result.size() - totalRead);
+                if (chunkRead <= 0)
+                {
+                    break;
+                }
+                totalRead += static_cast<size_t>(chunkRead);
+            }
+
+            if (totalRead != result.size())
+            {
+                result.clear();
+            }
+        }
+        else if (size < 0)
+        {
+            // Some archive entries report unknown size. Read as a stream.
+            constexpr size_t kReadChunk = 64 * 1024;
+            std::vector<uint8_t> streamBuf(kReadChunk);
+            size_t totalRead = 0;
+
+            while (true)
+            {
+                la_ssize_t chunkRead = archive_read_data(a, streamBuf.data(), streamBuf.size());
+                if (chunkRead == 0)
+                {
+                    break;
+                }
+                if (chunkRead < 0)
+                {
+                    result.clear();
+                    break;
+                }
+
+                totalRead += static_cast<size_t>(chunkRead);
+                if (totalRead > 1024ull * 1024ull * 1024ull)
+                {
+                    result.clear();
+                    break;
+                }
+
+                result.insert(
+                    result.end(),
+                    streamBuf.begin(),
+                    streamBuf.begin() + static_cast<std::ptrdiff_t>(chunkRead));
+            }
+        }
+        return result;
+    }
+
+    void ScanArchive(std::stop_token stop)
     {
         struct archive* a = archive_read_new();
         if (!a)
@@ -1732,6 +1871,10 @@ private:
         struct archive_entry* entry;
         while (true)
         {
+            if (stop.stop_requested())
+            {
+                break;   // the factory discards the partial reader
+            }
             int r = archive_read_next_header(a, &entry);
             if (r == ARCHIVE_EOF)
             {
@@ -1788,6 +1931,31 @@ size_t ArchiveReaderFactory::StatusQueryCountForTesting()
     return g_statusQueries.load();
 }
 
+size_t ArchiveReaderFactory::DataHandleOpenCountForTesting()
+{
+    return g_dataHandleOpens.load();
+}
+
+bool IArchiveReader::ExtractBatch(const std::vector<std::wstring>& entryPaths, std::stop_token stop, const BatchSink& onEntry)
+{
+    // Random access: each entry is extracted directly.
+    for (const std::wstring& entryPath : entryPaths)
+    {
+        if (stop.stop_requested())
+        {
+            return false;
+        }
+        std::vector<uint8_t> data = ExtractToMemory(entryPath);
+        // A stop requested while the entry was read suppresses its delivery.
+        if (stop.stop_requested())
+        {
+            return false;
+        }
+        onEntry(entryPath, std::move(data));
+    }
+    return !stop.stop_requested();
+}
+
 size_t ArchiveReaderFactory::OpenCountForTesting()
 {
     return g_opens.load();
@@ -1795,7 +1963,16 @@ size_t ArchiveReaderFactory::OpenCountForTesting()
 
 std::unique_ptr<IArchiveReader> ArchiveReaderFactory::Open(const std::filesystem::path& path)
 {
+    return Open(path, std::stop_token {});
+}
+
+std::unique_ptr<IArchiveReader> ArchiveReaderFactory::Open(const std::filesystem::path& path, std::stop_token stop)
+{
     ++g_opens;
+    if (stop.stop_requested())
+    {
+        return nullptr;
+    }
     if (!IsArchiveFile(path))
         return nullptr;
 
@@ -1805,7 +1982,7 @@ std::unique_ptr<IArchiveReader> ArchiveReaderFactory::Open(const std::filesystem
         if (ext == L".ba2")
         {
             auto reader = std::make_unique<Ba2Reader>(path);
-            if (reader->Entries().empty())
+            if (stop.stop_requested() || reader->Entries().empty())
             {
                 return nullptr;
             }
@@ -1814,7 +1991,7 @@ std::unique_ptr<IArchiveReader> ArchiveReaderFactory::Open(const std::filesystem
         if (ext == L".bsa")
         {
             auto reader = std::make_unique<BsaReader>(path);
-            if (reader->Entries().empty())
+            if (stop.stop_requested() || reader->Entries().empty())
             {
                 return nullptr;
             }
@@ -1822,10 +1999,10 @@ std::unique_ptr<IArchiveReader> ArchiveReaderFactory::Open(const std::filesystem
         }
 
 #if FLOAR_ENABLE_COMMON_ARCHIVES
-        auto reader = std::make_unique<LibArchiveReader>(path);
-        if (reader->Entries().empty())
+        auto reader = std::make_unique<LibArchiveReader>(path, stop);
+        if (stop.stop_requested() || reader->Entries().empty())
         {
-            return nullptr;
+            return nullptr;   // canceled scans are never returned
         }
 
         return reader;

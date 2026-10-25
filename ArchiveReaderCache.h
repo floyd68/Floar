@@ -8,6 +8,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <stop_token>
 #include <string>
 #include <unordered_map>
 
@@ -40,7 +41,8 @@ namespace Floar
 class ArchiveReaderCache
 {
 public:
-    using Opener = std::function<std::shared_ptr<IArchiveReader>(const std::filesystem::path&)>;
+    // Opens and scans an archive; returns null when `stop` interrupted it.
+    using Opener = std::function<std::shared_ptr<IArchiveReader>(const std::filesystem::path&, std::stop_token)>;
 
     static constexpr size_t kDefaultCapacity = 16;
 
@@ -49,8 +51,11 @@ public:
     // The cache behind VirtualFileSystem (ArchiveReaderFactory::Open).
     static ArchiveReaderCache& Shared();
 
-    // The reader for `archivePath`, or null when it cannot be opened (not cached).
-    std::shared_ptr<IArchiveReader> Get(const std::filesystem::path& archivePath);
+    // The reader for `archivePath`, or null when it cannot be opened (not
+    // cached). A cached reader is returned even when `stop` is requested; an
+    // open interrupted by `stop` returns null and caches nothing, and callers
+    // waiting for that open then open the archive themselves.
+    std::shared_ptr<IArchiveReader> Get(const std::filesystem::path& archivePath, std::stop_token stop = {});
 
     size_t Size() const;
     // Number of opener calls so far.
