@@ -65,7 +65,9 @@ class ArchiveReaderFactory
 {
 public:
     // A supported extension that names a regular file. The extension is checked
-    // first: other paths cost no file-system query.
+    // first: other paths cost no file-system query. A path over MAX_PATH that
+    // is not found is queried again in its extended-length form, as the
+    // archive open retries it (a process that is not long-path aware).
     static bool IsArchiveFile(const std::filesystem::path& path);
     // Opens and scans `path`; null when it is not a readable archive or `stop`
     // was requested before the scan finished (a partial reader is never returned).

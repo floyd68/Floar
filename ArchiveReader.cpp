@@ -198,6 +198,56 @@ namespace
         std::unordered_set<std::wstring> m_directories {};
     };
 
+    // The full path of `path` with the \\?\ (or \\?\UNC\) prefix, which lifts
+    // the MAX_PATH limit; empty when it has no such form. The same conversion
+    // as libarchive's __la_win_permissive_name_w.
+    std::wstring ExtendedLengthPath(const wchar_t* path)
+    {
+        const DWORD needed = GetFullPathNameW(path, 0, nullptr, nullptr);
+        if (needed == 0)
+        {
+            return {};
+        }
+        std::wstring full(static_cast<size_t>(needed) + 3, L'\0');
+        const DWORD length = GetFullPathNameW(path, static_cast<DWORD>(full.size()), full.data(), nullptr);
+        if (length == 0 || length >= full.size())
+        {
+            return {};
+        }
+        full.resize(length);
+
+        if (full.starts_with(L"\\\\?\\"))
+        {
+            return full;   // already extended
+        }
+        if (full.starts_with(L"\\\\.\\"))
+        {
+            // A device path; \\.\C:\ names a drive like \\?\C:\ does.
+            if (full.size() >= 7 && ((full[4] >= L'a' && full[4] <= L'z') || (full[4] >= L'A' && full[4] <= L'Z')) && full[5] == L':' && full[6] == L'\\')
+            {
+                full[2] = L'?';
+                return full;
+            }
+            return {};
+        }
+        if (full.starts_with(L"\\\\"))
+        {
+            // \\server\share\... -> \\?\UNC\server\share\...
+            const size_t share = full.find(L'\\', 2);
+            if (share == std::wstring::npos || share == 2)
+            {
+                return {};
+            }
+            const size_t rest = full.find(L'\\', share + 1);
+            if (rest == std::wstring::npos || rest == share + 1)
+            {
+                return {};
+            }
+            return L"\\\\?\\UNC\\" + full.substr(2);
+        }
+        return L"\\\\?\\" + full;
+    }
+
     std::atomic<size_t> g_statusQueries { 0 };
     std::atomic<size_t> g_opens { 0 };
     std::atomic<size_t> g_dataHandleOpens { 0 };
@@ -1769,11 +1819,28 @@ private:
 
         // Wide open: libarchive reads a narrow path in the active code page on
         // Windows, which cannot name files outside it. The sharing mode matches
-        // the CRT open libarchive's own file reader uses.
+        // the CRT open libarchive's own file reader uses. Like that reader, a
+        // path that is not found is retried in its extended-length form, so
+        // paths longer than MAX_PATH open.
         bool OpenFile(const std::filesystem::path& path)
         {
-            m_file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+            m_file = OpenForRead(path.c_str());
+            if (m_file == INVALID_HANDLE_VALUE)
+            {
+                const DWORD error = GetLastError();
+                if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND || error == ERROR_FILENAME_EXCED_RANGE)
+                {
+                    const std::wstring extended = ExtendedLengthPath(path.c_str());
+                    if (!extended.empty())
+                    {
+                        m_file = OpenForRead(extended.c_str());
+                        if (m_file == INVALID_HANDLE_VALUE)
+                        {
+                            SetLastError(error);   // report the original failure
+                        }
+                    }
+                }
+            }
             return m_file != INVALID_HANDLE_VALUE;
         }
 
@@ -1789,6 +1856,12 @@ private:
         }
 
     private:
+        static HANDLE OpenForRead(const wchar_t* path)
+        {
+            return CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        }
+
         static la_ssize_t ReadBlock(struct archive* a, void* data, const void** block)
         {
             auto* self = static_cast<StopAwareSource*>(data);
@@ -2070,7 +2143,24 @@ bool ArchiveReaderFactory::IsArchiveFile(const std::filesystem::path& path)
 
     ++g_statusQueries;
     std::error_code ec;
-    return std::filesystem::is_regular_file(std::filesystem::status(path, ec)) && !ec;
+    if (std::filesystem::is_regular_file(std::filesystem::status(path, ec)) && !ec)
+    {
+        return true;
+    }
+    if (path.native().size() < MAX_PATH)
+    {
+        return false;
+    }
+    // A path over MAX_PATH in a process that is not long-path aware is not
+    // found: retry in its extended-length form (the archive open does the same).
+    const std::wstring extended = ExtendedLengthPath(path.c_str());
+    if (extended.empty() || extended == path.native())
+    {
+        return false;
+    }
+    ++g_statusQueries;
+    ec.clear();
+    return std::filesystem::is_regular_file(std::filesystem::status(extended, ec)) && !ec;
 }
 
 size_t ArchiveReaderFactory::StatusQueryCountForTesting()

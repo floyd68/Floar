@@ -8,6 +8,7 @@
 
 #include <windows.h>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -449,5 +450,67 @@ FLOAR_TEST(StreamBatch_ConcurrentReadersShareOneReader)
     {
         FLOAR_CHECK(result == expected);
     }
+}
+
+namespace
+{
+    // An archive whose ordinary path is longer than MAX_PATH. Set up and
+    // removed through the extended-length (\\?\) form.
+    struct LongPathFixture
+    {
+        std::filesystem::path base { TempDir(L"long") };
+        std::filesystem::path zip {};
+        bool written = false;
+
+        static std::filesystem::path Extended(const std::filesystem::path& path)
+        {
+            return std::filesystem::path(L"\\\\?\\" + path.wstring());
+        }
+
+        LongPathFixture()
+        {
+            std::filesystem::path dir = base;
+            while (dir.wstring().size() < MAX_PATH + 40)
+            {
+                dir /= std::wstring(48, L'd');
+            }
+            std::error_code ec;
+            std::filesystem::create_directories(Extended(dir), ec);
+            zip = dir / L"long.zip";
+            written = !ec && FloarTest::WriteZip(Extended(zip),
+                { { L"a.txt", "alpha" }, { L"Folder/b.txt", "bravo" } }, { L"Folder/" });
+        }
+
+        ~LongPathFixture()
+        {
+            std::error_code ec;
+            std::filesystem::remove_all(Extended(base), ec);
+        }
+    };
+}
+
+FLOAR_TEST(StreamLongPath_ArchiveBeyondMaxPathScansAndExtracts)
+{
+    LongPathFixture fixture;
+    FLOAR_REQUIRE(fixture.written);
+    FLOAR_REQUIRE(fixture.zip.wstring().size() > MAX_PATH);
+
+    // Scan and extraction through the ordinary (non-prefixed) path.
+    const auto reader = ArchiveReaderFactory::Open(fixture.zip);
+    FLOAR_REQUIRE(reader != nullptr);
+    FLOAR_CHECK(reader->HasEntry(L"Folder/b.txt"));
+    std::map<std::wstring, std::string> extracted;
+    FLOAR_CHECK(reader->ExtractBatch({ L"a.txt", L"Folder/b.txt" }, {}, [&](const std::wstring& path, std::vector<uint8_t>&& data)
+    {
+        extracted[path] = std::string(data.begin(), data.end());
+    }));
+    FLOAR_CHECK(extracted[L"a.txt"] == "alpha");
+    FLOAR_CHECK(extracted[L"Folder/b.txt"] == "bravo");
+
+    // The same through the VFS and a cache.
+    ArchiveReaderCache cache(4);
+    const auto data = VirtualFileSystem::ReadFile(VirtualPath(fixture.zip, L"Folder/b.txt"), std::stop_token {}, cache);
+    FLOAR_CHECK(std::string(data.begin(), data.end()) == "bravo");
+    FLOAR_CHECK(cache.Shutdown(std::chrono::seconds(5)));
 }
 #endif
