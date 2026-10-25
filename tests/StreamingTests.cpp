@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -273,6 +274,73 @@ FLOAR_TEST(StreamBatch_StopsAtTheNextEntryBoundary)
     FLOAR_CHECK(!reader->ExtractBatch(request, Stopped().get_token(), [&](const std::wstring&, std::vector<uint8_t>&&) { ++calls; }));
     FLOAR_CHECK(calls == 0);
     FLOAR_CHECK(ArchiveReaderFactory::DataHandleOpenCountForTesting() == handlesBefore);
+}
+
+FLOAR_TEST(StreamBatch_StopFromACallbackEndsAliasesAndMissingEntries)
+{
+    BatchFixture fixture;
+    FLOAR_REQUIRE(fixture.written);
+    const auto reader = ArchiveReaderFactory::Open(fixture.zip);
+    FLOAR_REQUIRE(reader != nullptr);
+
+    // Three spellings of one entry: a stop from the first delivery ends the batch.
+    std::stop_source aliasStop;
+    int calls = 0;
+    FLOAR_CHECK(!reader->ExtractBatch({ L"a.txt", L"A.TXT", L"/a.txt" }, aliasStop.get_token(), [&](const std::wstring&, std::vector<uint8_t>&&)
+    {
+        ++calls;
+        aliasStop.request_stop();
+    }));
+    FLOAR_CHECK(calls == 1);
+
+    // Only missing entries (no scan): the same, and the call reports the stop.
+    std::stop_source missingStop;
+    calls = 0;
+    FLOAR_CHECK(!reader->ExtractBatch({ L"x.txt", L"y.txt", L"z.txt" }, missingStop.get_token(), [&](const std::wstring&, std::vector<uint8_t>&&)
+    {
+        ++calls;
+        missingStop.request_stop();
+    }));
+    FLOAR_CHECK(calls == 1);
+
+    // A stop from the last delivery is reported too.
+    std::stop_source lastStop;
+    calls = 0;
+    FLOAR_CHECK(!reader->ExtractBatch({ L"b.txt" }, lastStop.get_token(), [&](const std::wstring&, std::vector<uint8_t>&&)
+    {
+        ++calls;
+        lastStop.request_stop();
+    }));
+    FLOAR_CHECK(calls == 1);
+}
+
+FLOAR_TEST(StreamBatch_ThrowingCallbackReleasesTheArchive)
+{
+    BatchFixture fixture;
+    FLOAR_REQUIRE(fixture.written);
+    auto reader = ArchiveReaderFactory::Open(fixture.zip);
+    FLOAR_REQUIRE(reader != nullptr);
+
+    bool caught = false;
+    try
+    {
+        (void)reader->ExtractBatch({ L"a.txt", L"b.txt" }, {}, [](const std::wstring&, std::vector<uint8_t>&&)
+        {
+            throw std::runtime_error("callback failure");
+        });
+    }
+    catch (const std::runtime_error&)
+    {
+        caught = true;
+    }
+    FLOAR_CHECK(caught);
+
+    // The libarchive handle was freed: the archive is not held open, so it can
+    // be deleted (Windows refuses while a handle without delete sharing exists).
+    std::error_code ec;
+    FLOAR_CHECK(std::filesystem::remove(fixture.zip, ec) && !ec);
+    // The reader keeps no batch state.
+    FLOAR_CHECK(reader->Entries().size() == 6);
 }
 
 FLOAR_TEST(StreamBatch_ConcurrentReadersShareOneReader)

@@ -1644,9 +1644,11 @@ public:
 
         if (!wanted.empty() && !stop.stop_requested())
         {
-            struct archive* a = OpenForReading();
-            if (a != nullptr)
+            // Owned: freed even when a callback throws.
+            const ArchiveHandle handle = OpenForReading();
+            if (handle)
             {
+                struct archive* a = handle.get();
                 struct archive_entry* archiveEntry;
                 while (!wanted.empty())
                 {
@@ -1675,6 +1677,10 @@ public:
                     wanted.erase(found);
                     for (size_t k = 0; k < requests.size(); ++k)
                     {
+                        if (stop.stop_requested())
+                        {
+                            break;   // also between aliases of one entry
+                        }
                         const size_t index = requests[k];
                         delivered[index] = true;
                         if (k + 1 == requests.size())
@@ -1687,23 +1693,22 @@ public:
                         }
                     }
                 }
-                archive_read_free(a);
             }
         }
 
-        if (stop.stop_requested())
-        {
-            return false;
-        }
         // Missing, directory, or not reached by the scan: empty data.
         for (size_t i = 0; i < entryPaths.size(); ++i)
         {
+            if (stop.stop_requested())
+            {
+                return false;
+            }
             if (!delivered[i])
             {
                 onEntry(entryPaths[i], {});
             }
         }
-        return true;
+        return !stop.stop_requested();
     }
 
     bool HasEntry(const std::wstring& entryPath) override
@@ -1717,10 +1722,20 @@ public:
     }
 
 private:
-    // A libarchive handle positioned before the first header (null on failure).
-    struct archive* OpenForReading() const
+    struct ArchiveFree
     {
-        struct archive* a = archive_read_new();
+        void operator()(struct archive* a) const noexcept
+        {
+            archive_read_free(a);
+        }
+    };
+    using ArchiveHandle = std::unique_ptr<struct archive, ArchiveFree>;
+
+    // A libarchive handle positioned before the first header (null on failure).
+    ArchiveHandle OpenForReading() const
+    {
+        ArchiveHandle handle(archive_read_new());
+        struct archive* a = handle.get();
         if (!a)
         {
             return nullptr;
@@ -1743,10 +1758,9 @@ private:
         // Windows, which cannot name files outside it.
         if (archive_read_open_filename_w(a, m_path.c_str(), 10240) != ARCHIVE_OK)
         {
-            archive_read_free(a);
             return nullptr;
         }
-        return a;
+        return handle;
     }
 
     // Reads the data of the entry whose header was just read (empty on
@@ -1933,7 +1947,7 @@ bool IArchiveReader::ExtractBatch(const std::vector<std::wstring>& entryPaths, s
         }
         onEntry(entryPath, ExtractToMemory(entryPath));
     }
-    return true;
+    return !stop.stop_requested();
 }
 
 size_t ArchiveReaderFactory::OpenCountForTesting()
