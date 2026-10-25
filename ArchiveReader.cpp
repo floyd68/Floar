@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <clocale>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -199,6 +201,8 @@ namespace
     std::atomic<size_t> g_statusQueries { 0 };
     std::atomic<size_t> g_opens { 0 };
     std::atomic<size_t> g_dataHandleOpens { 0 };
+    std::atomic<size_t> g_extractionHeaders { 0 };
+    std::atomic<size_t> g_sourceBytes { 0 };
 
     std::wstring ExtensionFromFourCC(const char(&ext)[4])
     {
@@ -1645,10 +1649,10 @@ public:
         if (!wanted.empty() && !stop.stop_requested())
         {
             // Owned: freed even when a callback throws.
-            const ArchiveHandle handle = OpenForReading();
-            if (handle)
+            const ArchiveSession session = OpenForReading(stop);
+            if (session.handle)
             {
-                struct archive* a = handle.get();
+                struct archive* a = session.handle.get();
                 struct archive_entry* archiveEntry;
                 while (!wanted.empty())
                 {
@@ -1656,10 +1660,13 @@ public:
                     {
                         break;   // entry boundary
                     }
+                    // May decompress the entries it skips (solid archives);
+                    // the source checks stop before every block it reads.
                     if (archive_read_next_header(a, &archiveEntry) != ARCHIVE_OK)
                     {
                         break;
                     }
+                    ++g_extractionHeaders;
                     // UTF-8 view, independent of the CRT locale (see ScanArchive).
                     const char* name = archive_entry_pathname_utf8(archiveEntry);
                     if (!name)
@@ -1672,7 +1679,11 @@ public:
                         continue;
                     }
 
-                    std::vector<uint8_t> data = ReadCurrentEntry(a, archiveEntry);
+                    std::vector<uint8_t> data = ReadCurrentEntry(a, archiveEntry, stop);
+                    if (stop.stop_requested())
+                    {
+                        break;   // a partial entry is never delivered
+                    }
                     const std::vector<size_t> requests = std::move(found->second);
                     wanted.erase(found);
                     for (size_t k = 0; k < requests.size(); ++k)
@@ -1731,14 +1742,135 @@ private:
     };
     using ArchiveHandle = std::unique_ptr<struct archive, ArchiveFree>;
 
-    // A libarchive handle positioned before the first header (null on failure).
-    ArchiveHandle OpenForReading() const
+    // libarchive input over the archive file that checks `stop` before reading
+    // each block. A header read or a decompression step then fails within one
+    // block once stop is requested - including the 7z reader's deferred skip of
+    // every entry before the requested one in a solid block, which otherwise
+    // runs inside a single archive_read_data call with no reachable check.
+    // Skips and seeks stay seeks. Not interruptible: the block read in progress.
+    class StopAwareSource
     {
-        ArchiveHandle handle(archive_read_new());
-        struct archive* a = handle.get();
+    public:
+        static constexpr DWORD kBlockSize = 64 * 1024;
+
+        explicit StopAwareSource(std::stop_token stop)
+            : m_stop(std::move(stop))
+            , m_buffer(kBlockSize)
+        {
+        }
+
+        ~StopAwareSource()
+        {
+            Close();
+        }
+
+        StopAwareSource(const StopAwareSource&) = delete;
+        StopAwareSource& operator=(const StopAwareSource&) = delete;
+
+        // Wide open: libarchive reads a narrow path in the active code page on
+        // Windows, which cannot name files outside it. The sharing mode matches
+        // the CRT open libarchive's own file reader uses.
+        bool OpenFile(const std::filesystem::path& path)
+        {
+            m_file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+            return m_file != INVALID_HANDLE_VALUE;
+        }
+
+        // Feeds `a` from this source and reads the archive's signature.
+        int Attach(struct archive* a)
+        {
+            archive_read_set_callback_data(a, this);
+            archive_read_set_read_callback(a, &ReadBlock);
+            archive_read_set_skip_callback(a, &SkipBytes);
+            archive_read_set_seek_callback(a, &SeekTo);
+            archive_read_set_close_callback(a, &CloseFile);
+            return archive_read_open1(a);
+        }
+
+    private:
+        static la_ssize_t ReadBlock(struct archive* a, void* data, const void** block)
+        {
+            auto* self = static_cast<StopAwareSource*>(data);
+            if (self->m_stop.stop_requested())
+            {
+                archive_set_error(a, ECANCELED, "Stopped");
+                return -1;
+            }
+            DWORD read = 0;
+            if (!::ReadFile(self->m_file, self->m_buffer.data(), kBlockSize, &read, nullptr))
+            {
+                archive_set_error(a, EIO, "Read failed");
+                return -1;
+            }
+            g_sourceBytes += read;
+            *block = self->m_buffer.data();
+            return static_cast<la_ssize_t>(read);
+        }
+
+        static la_int64_t SkipBytes(struct archive*, void* data, la_int64_t request)
+        {
+            auto* self = static_cast<StopAwareSource*>(data);
+            LARGE_INTEGER distance {};
+            distance.QuadPart = request;
+            // 0: libarchive reads the bytes instead.
+            return SetFilePointerEx(self->m_file, distance, nullptr, FILE_CURRENT) ? request : 0;
+        }
+
+        static la_int64_t SeekTo(struct archive* a, void* data, la_int64_t offset, int whence)
+        {
+            auto* self = static_cast<StopAwareSource*>(data);
+            const DWORD method = (whence == SEEK_SET) ? FILE_BEGIN : (whence == SEEK_CUR) ? FILE_CURRENT : FILE_END;
+            LARGE_INTEGER distance {};
+            distance.QuadPart = offset;
+            LARGE_INTEGER position {};
+            if (!SetFilePointerEx(self->m_file, distance, &position, method))
+            {
+                archive_set_error(a, EIO, "Seek failed");
+                return ARCHIVE_FATAL;
+            }
+            return position.QuadPart;
+        }
+
+        static int CloseFile(struct archive*, void* data)
+        {
+            static_cast<StopAwareSource*>(data)->Close();
+            return ARCHIVE_OK;
+        }
+
+        void Close()
+        {
+            if (m_file != INVALID_HANDLE_VALUE)
+            {
+                CloseHandle(m_file);
+                m_file = INVALID_HANDLE_VALUE;
+            }
+        }
+
+        std::stop_token m_stop;
+        std::vector<char> m_buffer;
+        HANDLE m_file { INVALID_HANDLE_VALUE };
+    };
+
+    // The source outlives the handle: archive_read_free may still close it.
+    struct ArchiveSession
+    {
+        std::unique_ptr<StopAwareSource> source {};
+        ArchiveHandle handle {};
+        bool opened { false };   // positioned before the first header
+    };
+
+    // Formats and filters for ZIP/7z/RAR, read from `m_path` through a
+    // stop-aware source. On failure `opened` is false and the handle (when
+    // there is one) holds the error.
+    ArchiveSession OpenArchive(std::stop_token stop) const
+    {
+        ArchiveSession session;
+        session.handle.reset(archive_read_new());
+        struct archive* a = session.handle.get();
         if (!a)
         {
-            return nullptr;
+            return session;
         }
 
         // Enable only the formats we need
@@ -1753,20 +1885,38 @@ private:
         archive_read_support_filter_lzma(a);    // 7z LZMA
         archive_read_support_filter_xz(a);      // 7z XZ
 
-        ++g_dataHandleOpens;
-        // Wide open: libarchive reads a narrow path in the active code page on
-        // Windows, which cannot name files outside it.
-        if (archive_read_open_filename_w(a, m_path.c_str(), 10240) != ARCHIVE_OK)
+        session.source = std::make_unique<StopAwareSource>(std::move(stop));
+        if (!session.source->OpenFile(m_path))
         {
-            return nullptr;
+            // libarchive's own wording; the path is converted in the CRT locale
+            // (see ArchiveErrorUtf8).
+            const DWORD error = GetLastError();
+            const int code = (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) ? ENOENT : EACCES;
+            archive_set_error(a, code, "Failed to open '%ls'", m_path.c_str());
+            return session;
         }
-        return handle;
+        session.opened = session.source->Attach(a) == ARCHIVE_OK;
+        return session;
+    }
+
+    // A libarchive handle positioned before the first header (null on failure).
+    ArchiveSession OpenForReading(std::stop_token stop) const
+    {
+        ++g_dataHandleOpens;
+        ArchiveSession session = OpenArchive(std::move(stop));
+        if (!session.opened)
+        {
+            session.handle.reset();
+        }
+        return session;
     }
 
     // Reads the data of the entry whose header was just read (empty on
-    // failure or for entries over 1 GB).
-    static std::vector<uint8_t> ReadCurrentEntry(struct archive* a, struct archive_entry* archiveEntry)
+    // failure, for entries over 1 GB, or once `stop` is requested: it is
+    // checked between read chunks).
+    static std::vector<uint8_t> ReadCurrentEntry(struct archive* a, struct archive_entry* archiveEntry, std::stop_token stop)
     {
+        constexpr size_t kStopCheckChunk = 1024 * 1024;
         std::vector<uint8_t> result;
         la_int64_t size = archive_entry_size(archiveEntry);
 
@@ -1776,10 +1926,15 @@ private:
             size_t totalRead = 0;
             while (totalRead < result.size())
             {
+                if (stop.stop_requested())
+                {
+                    result.clear();
+                    break;
+                }
                 la_ssize_t chunkRead = archive_read_data(
                     a,
                     result.data() + totalRead,
-                    result.size() - totalRead);
+                    (std::min)(result.size() - totalRead, kStopCheckChunk));
                 if (chunkRead <= 0)
                 {
                     break;
@@ -1801,6 +1956,11 @@ private:
 
             while (true)
             {
+                if (stop.stop_requested())
+                {
+                    result.clear();
+                    break;
+                }
                 la_ssize_t chunkRead = archive_read_data(a, streamBuf.data(), streamBuf.size());
                 if (chunkRead == 0)
                 {
@@ -1830,34 +1990,20 @@ private:
 
     void ScanArchive(std::stop_token stop)
     {
-        struct archive* a = archive_read_new();
+        // Owned: freed on every return. The source checks `stop` per block.
+        const ArchiveSession session = OpenArchive(stop);
+        struct archive* a = session.handle.get();
         if (!a)
         {
             return;
         }
-
-#if FLOAR_ENABLE_COMMON_ARCHIVES
-        // Enable only the formats we need
-        archive_read_support_format_zip(a);
-        archive_read_support_format_7zip(a);
-        archive_read_support_format_rar(a);
-        archive_read_support_format_rar5(a);
-
-        // Enable only essential compression filters for ZIP/7z/RAR
-        archive_read_support_filter_none(a);    // Uncompressed
-        archive_read_support_filter_gzip(a);    // ZIP deflate/gzip
-        archive_read_support_filter_lzma(a);    // 7z LZMA
-        archive_read_support_filter_xz(a);      // 7z XZ
-#endif
-
-        // Wide open: libarchive reads a narrow path in the active code page on
-        // Windows, which cannot name files outside it.
-        int r = archive_read_open_filename_w(a, m_path.c_str(), 10240);
-        if (r != ARCHIVE_OK)
+        if (!session.opened)
         {
-            FLOAR_LOG_ERROR("[LibArchiveReader] ERROR: Failed to open {}: {}",
-                Log::ToUtf8(m_path), ArchiveErrorUtf8(a));
-            archive_read_free(a);
+            if (!stop.stop_requested())
+            {
+                FLOAR_LOG_ERROR("[LibArchiveReader] ERROR: Failed to open {}: {}",
+                    Log::ToUtf8(m_path), ArchiveErrorUtf8(a));
+            }
             return;
         }
 
@@ -1882,7 +2028,10 @@ private:
             }
             if (r != ARCHIVE_OK)
             {
-                FLOAR_LOG_ERROR("[LibArchiveReader] ERROR reading header: {}", ArchiveErrorUtf8(a));
+                if (!stop.stop_requested())
+                {
+                    FLOAR_LOG_ERROR("[LibArchiveReader] ERROR reading header: {}", ArchiveErrorUtf8(a));
+                }
                 break;
             }
 
@@ -1906,8 +2055,6 @@ private:
             m_entries.push_back(archEntry);
             m_entryMap[ArchiveInnerPathKey(archEntry.name)] = index;
         }
-
-        archive_read_free(a);
     }
 };
 #endif
@@ -1954,6 +2101,16 @@ bool IArchiveReader::ExtractBatch(const std::vector<std::wstring>& entryPaths, s
         onEntry(entryPath, std::move(data));
     }
     return !stop.stop_requested();
+}
+
+size_t ArchiveReaderFactory::ExtractionHeaderCountForTesting()
+{
+    return g_extractionHeaders.load();
+}
+
+size_t ArchiveReaderFactory::LibArchiveBytesReadForTesting()
+{
+    return g_sourceBytes.load();
 }
 
 size_t ArchiveReaderFactory::OpenCountForTesting()
