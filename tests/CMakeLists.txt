@@ -7,7 +7,9 @@ add_executable(FloarTests
     TestHarness.h
     TestMain.cpp
     Ba2Tests.cpp
+    CancelReadTests.cpp
     LogTests.cpp
+    OpenPoolTests.cpp
     StreamingTests.cpp
     VfsTests.cpp
 )
@@ -45,5 +47,7 @@ add_test(NAME Floar.Log COMMAND FloarTests Log_)
 add_test(NAME Floar.Vfs COMMAND FloarTests Vfs)
 add_test(NAME Floar.Ba2 COMMAND FloarTests Ba2_)
 add_test(NAME Floar.Streaming COMMAND FloarTests Stream)
+add_test(NAME Floar.OpenPool COMMAND FloarTests Pool_)
+add_test(NAME Floar.CancelRead COMMAND FloarTests Cancel_)
 # Safety net only: the tests contain no unbounded waits.
-set_tests_properties(Floar.Log Floar.Vfs Floar.Ba2 Floar.Streaming PROPERTIES TIMEOUT 120)
+set_tests_properties(Floar.Log Floar.Vfs Floar.Ba2 Floar.Streaming Floar.OpenPool Floar.CancelRead PROPERTIES TIMEOUT 120)

@@ -51,16 +51,44 @@ bool VirtualFileSystem::EnumerateDirectory(
 
 std::vector<uint8_t> VirtualFileSystem::ReadFile(const VirtualPath& filePath)
 {
+    return ReadFile(filePath, std::stop_token {}, ArchiveReaderCache::Shared());
+}
+
+std::vector<uint8_t> VirtualFileSystem::ReadFile(const VirtualPath& filePath, std::stop_token stop)
+{
+    return ReadFile(filePath, stop, ArchiveReaderCache::Shared());
+}
+
+std::vector<uint8_t> VirtualFileSystem::ReadFile(const VirtualPath& filePath, std::stop_token stop, ArchiveReaderCache& cache)
+{
+    if (stop.stop_requested())
+    {
+        return {};
+    }
     if (filePath.IsInArchive())
     {
-        auto reader = GetCachedReader(filePath.hostPath);
+        auto reader = cache.Get(filePath.hostPath, stop);
+        if (stop.stop_requested())
+        {
+            return {};
+        }
         if (!reader)
         {
             FLOAR_LOG_WARN("[VFS] Failed to open archive reader.");
             return {};
         }
 
-        auto data = reader->ExtractToMemory(filePath.archiveInnerPath);
+        std::vector<uint8_t> data;
+        const bool completed = reader->ExtractBatch({ filePath.archiveInnerPath }, stop,
+            [&data](const std::wstring&, std::vector<uint8_t>&& entryData)
+            {
+                data = std::move(entryData);
+            });
+        // Nothing partial or late: a stop during extraction drops the data.
+        if (!completed || stop.stop_requested())
+        {
+            return {};
+        }
         if (data.empty())
         {
             FLOAR_LOG_WARN("[VFS] Archive entry read returned empty data.");
