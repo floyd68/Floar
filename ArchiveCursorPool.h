@@ -32,8 +32,8 @@ struct ArchiveCursorLimits
     // image never waits behind Normal (thumbnail) cursors; Normal requests may
     // use the limit minus this, but at least one.
     size_t reservedForHigh { 1 };
-    // Retained cursors (positioned after the last entry they read, holding an
-    // open archive handle and its decompressor state), process-wide and per reader.
+    // Retained cursors (positioned after the last entry they read, holding
+    // their decompressor state), process-wide and per reader.
     size_t maxIdle { 2 };
     size_t maxIdlePerReader { 2 };
     // Estimated memory of active and idle cursors. Idle cursors are closed to
@@ -43,9 +43,9 @@ struct ArchiveCursorLimits
     std::uint64_t maxMemoryBytes { 256ull * 1024 * 1024 };
     // An idle cursor older than this is closed at the next pool operation
     // (there is no timer thread; TrimIdle closes every idle cursor at once).
-    // An idle cursor keeps its archive open (read/write/delete sharing): until
-    // it is closed, renaming another file over the archive fails with
-    // ERROR_ACCESS_DENIED (rewriting it in place or deleting it succeeds).
+    // An idle cursor holds no handle to its archive file (it reopens the file
+    // when it resumes and is refused if the file changed), so the archive can
+    // be renamed over, rewritten or deleted while cursors are retained.
     std::chrono::milliseconds idleTimeout { std::chrono::seconds(15) };
 };
 
@@ -96,7 +96,7 @@ struct ArchiveCursorStats
 class ArchiveCursorPool
 {
 public:
-    // A format's open archive handle and decompressor state.
+    // A format's archive handle and decompressor state.
     class Cursor
     {
     public:

@@ -1903,6 +1903,7 @@ private:
         // paths longer than MAX_PATH open.
         bool OpenFile(const std::filesystem::path& path)
         {
+            m_path = path;
             m_file = OpenForRead(path.c_str());
             if (m_file == INVALID_HANDLE_VALUE)
             {
@@ -1938,6 +1939,39 @@ private:
         FileIdentity Identity() const
         {
             return m_file == INVALID_HANDLE_VALUE ? FileIdentity {} : IdentityOfHandle(m_file);
+        }
+
+        // An idle cursor: closes the file handle and keeps the position, the
+        // block buffer (libarchive may still consume the last block) and the
+        // decompressor state, so the archive can be renamed over or deleted
+        // while the cursor is retained.
+        void Suspend()
+        {
+            Close();
+        }
+
+        // Before a suspended cursor reads again: reopens the file at the
+        // position of its next block read. False when it cannot be opened or
+        // no longer has `expected` identity (it was replaced or rewritten):
+        // the cursor is then refused.
+        bool Resume(const FileIdentity& expected)
+        {
+            if (m_file != INVALID_HANDLE_VALUE)
+            {
+                return true;
+            }
+            if (!OpenFile(m_path))
+            {
+                return false;
+            }
+            LARGE_INTEGER distance {};
+            distance.QuadPart = static_cast<LONGLONG>(m_offset);
+            if ((expected.known && Identity() != expected) || !SetFilePointerEx(m_file, distance, nullptr, FILE_BEGIN))
+            {
+                Close();
+                return false;
+            }
+            return true;
         }
 
     private:
@@ -2020,6 +2054,7 @@ private:
 
         std::stop_token m_stop;
         std::vector<char> m_buffer;
+        std::filesystem::path m_path {};
         HANDLE m_file { INVALID_HANDLE_VALUE };
         uint64_t m_offset { 0 };   // file position of the next block read
     };
@@ -2152,10 +2187,16 @@ private:
             return PassEnd::StoppedAtBoundary;
         }
         // A retained cursor reads the file it opened: refuse it once the path
-        // names other content (replaced or rewritten since the scan).
-        if (lease.cursor && m_pathIdentity.known && IdentityOfPath(m_path) != m_pathIdentity)
+        // names other content (replaced or rewritten since the scan), or when
+        // its file, closed while it was idle, cannot be reopened as the one
+        // that was scanned.
+        if (lease.cursor)
         {
-            lease.Invalidate();
+            StopAwareSource& retained = *static_cast<Cursor&>(*lease.cursor).session.source;
+            if ((m_pathIdentity.known && IdentityOfPath(m_path) != m_pathIdentity) || !retained.Resume(m_identity))
+            {
+                lease.Invalidate();
+            }
         }
         if (!lease.cursor)
         {
@@ -2184,8 +2225,14 @@ private:
         const PassEnd end = RunPass(a, lease.position, targets, pass, headers, entries);
         source.SetStop({});
         lease.CountProgress(headers, entries);
-        // Kept only at a known position with entries left to read.
-        lease.Finish(end != PassEnd::Broken && lease.position < m_headerCount && m_retainCursors.load());
+        // Kept only at a known position with entries left to read, without
+        // its file handle while idle (StopAwareSource::Suspend).
+        const bool keep = end != PassEnd::Broken && lease.position < m_headerCount && m_retainCursors.load();
+        if (keep)
+        {
+            source.Suspend();
+        }
+        lease.Finish(keep);
         return end;
     }
 

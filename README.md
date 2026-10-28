@@ -28,7 +28,7 @@ solid block. `IArchiveReader::HasExpensiveRandomAccess()` reports such readers
 forward cursors from an `ArchiveCursorPool` (`ArchiveCursorPool::Shared()`
 unless `ArchiveReaderFactory::Open` is given another pool):
 
-- A cursor is an open archive handle positioned after the entry headers it
+- A cursor is a libarchive handle positioned after the entry headers it
   consumed. After an extraction it is kept, idle, at that position; a later
   request of the same reader whose first entry (in `ArchiveOrder`) is at or
   after it continues from there, without reopening the archive or
@@ -62,9 +62,12 @@ unless `ArchiveReaderFactory::Open` is given another pool):
   The pool lock is never held while reading, opening or closing a cursor or
   running a callback. A nested extraction on a thread that already holds a
   cursor is admitted at once.
-- An idle cursor keeps its archive open with read/write/delete sharing: while
-  it is retained, renaming another file over the archive fails
-  (ERROR_ACCESS_DENIED); rewriting or deleting it succeeds.
+- An idle cursor closes its archive file handle and keeps only its position
+  and decompressor state; it reopens the file when it resumes, and is refused
+  (a restart) when the file no longer has the size and write time that were
+  scanned. So the archive can be renamed over (a replace by rename fails with
+  ERROR_ACCESS_DENIED while any handle is open, whatever its sharing mode),
+  rewritten or deleted while cursors are retained.
 
 Memory: libarchive does not report a cursor's dictionary size, so each reader
 estimates it once as its unpacked size rounded up to a power of two between

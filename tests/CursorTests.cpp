@@ -548,10 +548,8 @@ FLOAR_TEST(CursorRead_HighPriorityIsNotBlockedByNormalCursors)
 namespace
 {
     // Rewrites `target` in place with the bytes of `source` and a later write
-    // time. A retained cursor's handle then reads the new bytes, so only the
-    // identity check keeps them from a reader that scanned the old ones.
-    // (Renaming over an archive that a cursor holds open fails with
-    // ERROR_ACCESS_DENIED, as for any file open without POSIX rename.)
+    // time. A retained cursor's reopened file then has the new bytes, so only
+    // the identity check keeps them from a reader that scanned the old ones.
     bool OverwriteInPlace(const std::filesystem::path& source, const std::filesystem::path& target)
     {
         std::error_code ec;
@@ -607,6 +605,52 @@ FLOAR_TEST(CursorRead_ReplacedArchiveIsNeverServedFromOldCursors)
         FLOAR_CHECK(stats.invalidated == 2);   // the retained cursor, then the reopened file
         FLOAR_CHECK(stats.idle == 0);
     }
+}
+
+// An idle cursor holds no handle to its archive: another file can be renamed
+// over the archive (which fails with ERROR_ACCESS_DENIED while any handle is
+// open, whatever its sharing mode) and the archive deleted, while the cursor
+// is retained. An unchanged file is reopened when the cursor resumes; a
+// replaced one refuses the cursor.
+FLOAR_TEST(CursorRead_IdleCursorLetsTheArchiveBeRenamedOverAndDeleted)
+{
+    Fixture fixture(L"rename");
+    FLOAR_REQUIRE(fixture.written);
+    const auto replacement = fixture.dir.path / L"replacement.7z";
+    FLOAR_REQUIRE(WriteFixture(replacement, 'A'));
+    const auto pool = NewPool();
+    const auto reader = ArchiveReaderFactory::Open(fixture.archive, {}, pool);
+    FLOAR_REQUIRE(reader != nullptr);
+
+    // Resuming an idle cursor of an unchanged file continues it.
+    FLOAR_CHECK(reader->ExtractToMemory(EntryName(0)) == Bytes(EntryData(0)));
+    FLOAR_REQUIRE(pool->Stats().idle == 1);
+    const Counters counters;
+    FLOAR_CHECK(reader->ExtractToMemory(EntryName(1)) == Bytes(EntryData(1)));
+    FLOAR_CHECK(counters.Handles() == 0);
+    FLOAR_CHECK(counters.Headers() == 1);
+    FLOAR_CHECK(pool->Stats().resumes == 1);
+    FLOAR_REQUIRE(pool->Stats().idle == 1);
+
+    // Rename over the archive while the cursor is idle.
+    const BOOL renamed = MoveFileExW(replacement.c_str(), fixture.archive.c_str(), MOVEFILE_REPLACE_EXISTING);
+    std::printf("  rename over an archive with an idle cursor: %s (error %lu)\n", renamed ? "ok" : "failed", renamed ? 0ul : GetLastError());
+    FLOAR_REQUIRE(renamed);
+    FLOAR_CHECK(pool->Stats().idle == 1);
+    // The reader never serves the replacement through its retained cursor.
+    FLOAR_CHECK(reader->ExtractToMemory(EntryName(2)).empty());
+    FLOAR_CHECK(pool->Stats().invalidated >= 1);
+
+    // A new reader of the replacement retains a cursor; the file can still be deleted.
+    const auto newReader = ArchiveReaderFactory::Open(fixture.archive, {}, pool);
+    FLOAR_REQUIRE(newReader != nullptr);
+    FLOAR_CHECK(newReader->ExtractToMemory(EntryName(2)) == Bytes(EntryData(2, 'A')));
+    FLOAR_REQUIRE(pool->Stats().idle == 1);
+    FLOAR_CHECK(DeleteFileW(fixture.archive.c_str()) != FALSE);
+    FLOAR_CHECK(!std::filesystem::exists(fixture.archive));
+    // The deleted file cannot be reopened: the cursor is refused, nothing is read.
+    FLOAR_CHECK(newReader->ExtractToMemory(EntryName(3)).empty());
+    FLOAR_CHECK(pool->Stats().idle == 0);
 }
 
 FLOAR_TEST(CursorRead_CacheClosesTheCursorsOfAReplacedReader)
