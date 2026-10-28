@@ -147,6 +147,7 @@ endif()
 add_library(Floar STATIC)
 
 target_sources(Floar PRIVATE
+    ArchiveCursorPool.cpp
     ArchiveReader.cpp
     ArchiveReaderCache.cpp
     FloarLog.cpp
