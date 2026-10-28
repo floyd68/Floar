@@ -2,6 +2,8 @@
 
 #include "VirtualPath.h"
 #include <cstddef>
+#include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <stop_token>
 #include <vector>
@@ -82,6 +84,22 @@ public:
     static std::vector<uint8_t> ReadFile(const VirtualPath& filePath, std::stop_token stop);
     // The same, with archive readers from `cache` (an injected opener in tests).
     static std::vector<uint8_t> ReadFile(const VirtualPath& filePath, std::stop_token stop, ArchiveReaderCache& cache);
+    // Test seam for plain-file reads (both ReadFile overloads), process-wide:
+    // install it only while no other plain-file read runs, and clear it by
+    // installing an empty hook. Both callbacks are optional and run on the
+    // reading thread.
+    struct PlainFileReadHook
+    {
+        // Before the file is opened.
+        std::function<void(const std::filesystem::path& path)> beforeOpen;
+        // Before every chunk read, with the chunk's file offset and size. It
+        // may change the file (for example truncate it). A nonzero result is a
+        // Win32 error code that fails this chunk read in place of the OS read
+        // (for example ERROR_OPERATION_ABORTED).
+        std::function<uint32_t(uint64_t offset, size_t size)> beforeChunk;
+    };
+    static void SetPlainFileReadHook(PlainFileReadHook hook);
+
     static bool Exists(const VirtualPath& path);
     static bool IsDirectory(const VirtualPath& path);
 

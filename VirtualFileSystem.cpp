@@ -5,6 +5,7 @@
 #include "FloarLog.h"
 #include <algorithm>
 #include <memory>
+#include <mutex>
 #include <system_error>
 #include <unordered_set>
 
@@ -20,6 +21,15 @@ namespace
     }
 
     constexpr int64_t kMaxPlainFileSize = 1024 * 1024 * 1024;
+
+    std::mutex g_plainFileReadHookMutex;
+    std::shared_ptr<const VirtualFileSystem::PlainFileReadHook> g_plainFileReadHook;
+
+    std::shared_ptr<const VirtualFileSystem::PlainFileReadHook> CurrentPlainFileReadHook()
+    {
+        std::lock_guard lock(g_plainFileReadHookMutex);
+        return g_plainFileReadHook;
+    }
 
     struct FileHandle
     {
@@ -42,6 +52,12 @@ namespace
     // chunk read (which itself is not interrupted).
     std::vector<uint8_t> ReadPlainFile(const std::filesystem::path& path, std::stop_token stop)
     {
+        const auto hook = CurrentPlainFileReadHook();
+        if (hook && hook->beforeOpen)
+        {
+            hook->beforeOpen(path);
+        }
+
         FileHandle file;
         file.handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -66,15 +82,23 @@ namespace
             }
             const DWORD chunk = static_cast<DWORD>((std::min)(data.size() - offset, VirtualFileSystem::kPlainFileReadChunk));
             DWORD read = 0;
-            if (!::ReadFile(file.handle, data.data() + offset, chunk, &read, nullptr))
+            DWORD error = ERROR_SUCCESS;
+            if (hook && hook->beforeChunk)
             {
-                const DWORD error = GetLastError();
-                if (error == ERROR_OPERATION_ABORTED)
-                {
-                    // The caller's CancelSynchronousIo.
-                    FLOAR_LOG_DEBUG("[VFS] Plain file read aborted at {} of {} bytes: {}", offset, data.size(), Log::ToUtf8(path));
-                    return {};
-                }
+                error = hook->beforeChunk(offset, chunk);
+            }
+            if (error == ERROR_SUCCESS && !::ReadFile(file.handle, data.data() + offset, chunk, &read, nullptr))
+            {
+                error = GetLastError();
+            }
+            if (error == ERROR_OPERATION_ABORTED)
+            {
+                // The caller's CancelSynchronousIo.
+                FLOAR_LOG_DEBUG("[VFS] Plain file read aborted at {} of {} bytes: {}", offset, data.size(), Log::ToUtf8(path));
+                return {};
+            }
+            if (error != ERROR_SUCCESS)
+            {
                 FLOAR_LOG_WARN("[VFS] Plain file read failed at {} of {} bytes (error {}): {}",
                     offset, data.size(), error, Log::ToUtf8(path));
                 return {};
@@ -122,6 +146,17 @@ bool VirtualFileSystem::EnumerateDirectory(
         return EnumerateArchive(dirPath.hostPath, std::wstring(), stop, onEntry);
     }
     return EnumerateFilesystem(dirPath.hostPath, stop, onEntry);
+}
+
+void VirtualFileSystem::SetPlainFileReadHook(PlainFileReadHook hook)
+{
+    std::shared_ptr<const PlainFileReadHook> installed;
+    if (hook.beforeOpen || hook.beforeChunk)
+    {
+        installed = std::make_shared<const PlainFileReadHook>(std::move(hook));
+    }
+    std::lock_guard lock(g_plainFileReadHookMutex);
+    g_plainFileReadHook = std::move(installed);
 }
 
 std::vector<uint8_t> VirtualFileSystem::ReadFile(const VirtualPath& filePath)
