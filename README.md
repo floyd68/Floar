@@ -46,8 +46,10 @@ unless `ArchiveReaderFactory::Open` is given another pool):
   decompression error), EOF before a requested entry, a header that is not the
   scanned one, or a throwing callback it is closed. A cursor that reached the
   last entry is closed. Missing and directory entries do not move it.
-- Archive replacement: a reader remembers the size and write time of the file
-  it scanned (the change check `ArchiveReaderCache` uses). A retained cursor is
+- Archive replacement: a reader remembers the identity of the file it scanned
+  (size, write time, volume serial number and file ID: the change check
+  `ArchiveReaderCache` uses, so another file renamed over the archive differs
+  even with the same size and write time). A retained cursor is
   refused once the path's identity differs, and a newly opened handle whose
   file differs is not read: an old reader returns empty data rather than the
   new file's content. `ArchiveReaderCache` closes the idle cursors of a reader
@@ -64,8 +66,8 @@ unless `ArchiveReaderFactory::Open` is given another pool):
   cursor is admitted at once.
 - An idle cursor closes its archive file handle and keeps only its position
   and decompressor state; it reopens the file when it resumes, and is refused
-  (a restart) when the file no longer has the size and write time that were
-  scanned. So the archive can be renamed over (a replace by rename fails with
+  (a restart) when the file no longer has the identity that was scanned. So
+  the archive can be renamed over (a replace by rename fails with
   ERROR_ACCESS_DENIED while any handle is open, whatever its sharing mode),
   rewritten or deleted while cursors are retained.
 

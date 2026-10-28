@@ -9,6 +9,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -651,6 +652,85 @@ FLOAR_TEST(CursorRead_IdleCursorLetsTheArchiveBeRenamedOverAndDeleted)
     // The deleted file cannot be reopened: the cursor is refused, nothing is read.
     FLOAR_CHECK(newReader->ExtractToMemory(EntryName(3)).empty());
     FLOAR_CHECK(pool->Stats().idle == 0);
+}
+
+namespace
+{
+    // Pads the shorter of two archives with zeros (7z ignores bytes after its
+    // end header) and gives both one write time, so `replacement` renamed over
+    // `original` leaves the path's size and write time unchanged: only the
+    // file ID tells the two files apart.
+    bool MakeLookAlike(const std::filesystem::path& original, const std::filesystem::path& replacement)
+    {
+        std::error_code ec;
+        const auto size = (std::max)(std::filesystem::file_size(original, ec), std::filesystem::file_size(replacement, ec));
+        if (ec)
+        {
+            return false;
+        }
+        FILETIME now {};
+        GetSystemTimeAsFileTime(&now);
+        for (const auto& path : { original, replacement })
+        {
+            const HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (file == INVALID_HANDLE_VALUE)
+            {
+                return false;
+            }
+            LARGE_INTEGER end {};
+            end.QuadPart = static_cast<LONGLONG>(size);
+            const bool ok = SetFilePointerEx(file, end, nullptr, FILE_BEGIN) && SetEndOfFile(file) &&
+                SetFileTime(file, nullptr, nullptr, &now);
+            CloseHandle(file);
+            if (!ok)
+            {
+                return false;
+            }
+        }
+        return std::filesystem::file_size(original, ec) == std::filesystem::file_size(replacement, ec) && !ec;
+    }
+}
+
+// Another archive of the same size and write time renamed over one with a
+// suspended cursor: the old reader never reads the replacement through that
+// cursor (or a new handle), and the cache opens the replacement as a new
+// archive instead of returning the old reader.
+FLOAR_TEST(CursorRead_LookAlikeReplacementIsNeverServedFromOldCursors)
+{
+    Fixture fixture(L"lookalike");
+    FLOAR_REQUIRE(fixture.written);
+    const auto replacement = fixture.dir.path / L"replacement.7z";
+    FLOAR_REQUIRE(WriteFixture(replacement, 'A'));
+    FLOAR_REQUIRE(MakeLookAlike(fixture.archive, replacement));
+    const auto pool = NewPool();
+    ArchiveReaderCache cache(4, [pool](const std::filesystem::path& path, std::stop_token stop)
+    {
+        return std::shared_ptr<IArchiveReader>(ArchiveReaderFactory::Open(path, stop, pool));
+    });
+
+    const auto oldReader = cache.Get(fixture.archive);
+    FLOAR_REQUIRE(oldReader != nullptr);
+    FLOAR_CHECK(oldReader->ExtractToMemory(EntryName(0)) == Bytes(EntryData(0)));
+    FLOAR_REQUIRE(pool->Stats().idle == 1);
+    FLOAR_REQUIRE(cache.Get(fixture.archive) == oldReader);   // unchanged: the same reader
+
+    const auto size = std::filesystem::file_size(fixture.archive);
+    const auto writeTime = std::filesystem::last_write_time(fixture.archive);
+    FLOAR_REQUIRE(MoveFileExW(replacement.c_str(), fixture.archive.c_str(), MOVEFILE_REPLACE_EXISTING));
+    FLOAR_REQUIRE(std::filesystem::file_size(fixture.archive) == size);
+    FLOAR_REQUIRE(std::filesystem::last_write_time(fixture.archive) == writeTime);
+
+    // The suspended cursor is refused, and so is a newly opened handle.
+    FLOAR_CHECK(oldReader->ExtractToMemory(EntryName(1)).empty());
+    FLOAR_CHECK(pool->Stats().invalidated == 2);
+    FLOAR_CHECK(pool->Stats().idle == 0);
+
+    const auto newReader = cache.Get(fixture.archive);
+    FLOAR_REQUIRE(newReader != nullptr);
+    FLOAR_CHECK(newReader != oldReader);
+    FLOAR_CHECK(newReader->ExtractToMemory(EntryName(1)) == Bytes(EntryData(1, 'A')));
+    FLOAR_CHECK(cache.Shutdown(5s));
 }
 
 FLOAR_TEST(CursorRead_CacheClosesTheCursorsOfAReplacedReader)

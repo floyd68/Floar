@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ArchiveReader.h"
+#include "FileIdentity.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -29,11 +30,17 @@ namespace Floar
 //   that same path is used for the key, the change check and the open, so a
 //   reader never keeps a relative path whose meaning changes with the current
 //   directory.
-// - Change detection: the file's size and last-write time, read once per
-//   lookup. A reader is reopened when either differs. When the metadata cannot
-//   be read (file locked, deleted, offline), a cached reader is kept - reads
-//   then fail on their own if the file is gone - and with no cached reader the
-//   archive is opened (which fails if it is missing).
+// - Change detection: the file's identity (FileIdentity.h: size, last-write
+//   time, volume serial number and file ID), read once per lookup through a
+//   handle opened without data access and closed at once. A reader is
+//   reopened when any of them differs, so another file renamed over the
+//   archive gets a new reader even with the same size and write time. When
+//   the path is not found (deleted, or between a delete and a re-create), a
+//   cached reader is kept - reads then fail on their own if the file is gone;
+//   when the file exists but its identity cannot be read (or could not be
+//   when the reader was opened), it is treated as changed and opened again.
+//   With no cached reader the archive is opened (which fails if it is
+//   missing).
 // - Opens: every open and scan runs as one operation on a worker owned by the
 //   cache (never on a caller's thread), at most `maxOpenWorkers` at once, one
 //   operation per worker. Workers start lazily, when the first open needs one,
@@ -131,14 +138,7 @@ public:
     static std::wstring Key(const std::filesystem::path& archivePath);
 
 private:
-    struct Identity
-    {
-        bool known { false };
-        std::uintmax_t size { 0 };
-        std::filesystem::file_time_type writeTime {};
-
-        bool operator==(const Identity&) const = default;
-    };
+    using Identity = FileIdentity;
 
     struct Operation;
     struct Worker;
@@ -185,7 +185,6 @@ private:
     };
 
     static std::filesystem::path Resolve(const std::filesystem::path& archivePath);
-    static Identity ReadIdentity(const std::filesystem::path& archivePath);
     // Evicts least-recently-used entries without an active lookup, into `evicted`.
     void EvictLocked(std::vector<std::shared_ptr<Slot>>& evicted);
     // Closes the idle cursors of evicted readers (not under m_mutex).

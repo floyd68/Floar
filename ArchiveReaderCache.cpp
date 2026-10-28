@@ -44,32 +44,6 @@ std::wstring ArchiveReaderCache::Key(const std::filesystem::path& archivePath)
     return HostPathKey(Resolve(archivePath));
 }
 
-ArchiveReaderCache::Identity ArchiveReaderCache::ReadIdentity(const std::filesystem::path& archivePath)
-{
-    // One attribute query: directory_entry caches size and write time.
-    Identity identity {};
-    std::error_code ec;
-    const std::filesystem::directory_entry entry(archivePath, ec);
-    if (ec)
-    {
-        return identity;
-    }
-    const std::uintmax_t size = entry.file_size(ec);
-    if (ec)
-    {
-        return identity;
-    }
-    const std::filesystem::file_time_type writeTime = entry.last_write_time(ec);
-    if (ec)
-    {
-        return identity;
-    }
-    identity.known = true;
-    identity.size = size;
-    identity.writeTime = writeTime;
-    return identity;
-}
-
 std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::path& archivePath, std::stop_token stop)
 {
     {
@@ -83,7 +57,8 @@ std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::p
     // One absolute path for the key, the change check and the open.
     const std::filesystem::path path = Resolve(archivePath);
     const std::wstring key = HostPathKey(path);
-    const Identity identity = ReadIdentity(path);
+    bool missing = false;
+    const Identity identity = FileIdentityOfPath(path, &missing);
 
     std::unique_lock<std::mutex> lock(m_mutex);
     if (m_shutdown)
@@ -108,7 +83,10 @@ std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::p
     EvictLocked(evicted);
 
     std::shared_ptr<IArchiveReader> reader;
-    if (slot->reader && (!identity.known || slot->identity == identity))
+    // Not found: keep the reader (its reads fail on their own if the file is
+    // gone). Unreadable, now or when the reader was opened: never reused.
+    const bool keepWhileMissing = !identity.known && missing;
+    if (slot->reader && (keepWhileMissing || (identity.known && slot->identity == identity)))
     {
         reader = slot->reader;
     }

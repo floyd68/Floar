@@ -1,6 +1,7 @@
 #include "ArchiveReader.h"
 #include "ArchiveTypes.h"
 #include "StringUtil.h"
+#include "FileIdentity.h"
 #include "FloarLog.h"
 #include "VirtualPath.h"
 
@@ -199,56 +200,6 @@ namespace
         std::unordered_set<std::wstring> m_directories {};
     };
 
-    // The full path of `path` with the \\?\ (or \\?\UNC\) prefix, which lifts
-    // the MAX_PATH limit; empty when it has no such form. The same conversion
-    // as libarchive's __la_win_permissive_name_w.
-    std::wstring ExtendedLengthPath(const wchar_t* path)
-    {
-        const DWORD needed = GetFullPathNameW(path, 0, nullptr, nullptr);
-        if (needed == 0)
-        {
-            return {};
-        }
-        std::wstring full(static_cast<size_t>(needed) + 3, L'\0');
-        const DWORD length = GetFullPathNameW(path, static_cast<DWORD>(full.size()), full.data(), nullptr);
-        if (length == 0 || length >= full.size())
-        {
-            return {};
-        }
-        full.resize(length);
-
-        if (full.starts_with(L"\\\\?\\"))
-        {
-            return full;   // already extended
-        }
-        if (full.starts_with(L"\\\\.\\"))
-        {
-            // A device path; \\.\C:\ names a drive like \\?\C:\ does.
-            if (full.size() >= 7 && ((full[4] >= L'a' && full[4] <= L'z') || (full[4] >= L'A' && full[4] <= L'Z')) && full[5] == L':' && full[6] == L'\\')
-            {
-                full[2] = L'?';
-                return full;
-            }
-            return {};
-        }
-        if (full.starts_with(L"\\\\"))
-        {
-            // \\server\share\... -> \\?\UNC\server\share\...
-            const size_t share = full.find(L'\\', 2);
-            if (share == std::wstring::npos || share == 2)
-            {
-                return {};
-            }
-            const size_t rest = full.find(L'\\', share + 1);
-            if (rest == std::wstring::npos || rest == share + 1)
-            {
-                return {};
-            }
-            return L"\\\\?\\UNC\\" + full.substr(2);
-        }
-        return L"\\\\?\\" + full;
-    }
-
     std::atomic<size_t> g_statusQueries { 0 };
     std::atomic<size_t> g_opens { 0 };
     std::atomic<size_t> g_dataHandleOpens { 0 };
@@ -259,61 +210,6 @@ namespace
     // SetLibArchiveReadHookForTesting: installed only while no read runs.
     std::function<bool(uint64_t)> g_readHook;
     std::atomic<bool> g_hasReadHook { false };
-
-    // Size and last write time of an archive file: the change check
-    // ArchiveReaderCache uses, so a reader and its cursors agree with the cache
-    // on whether the file is still the one that was scanned.
-    struct FileIdentity
-    {
-        bool known { false };
-        uint64_t size { 0 };
-        uint64_t writeTime { 0 };
-
-        bool operator==(const FileIdentity&) const = default;
-    };
-
-    uint64_t FileTimeValue(const FILETIME& time)
-    {
-        return (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
-    }
-
-    FileIdentity IdentityOfHandle(HANDLE file)
-    {
-        BY_HANDLE_FILE_INFORMATION info {};
-        if (!GetFileInformationByHandle(file, &info))
-        {
-            return {};
-        }
-        FileIdentity identity;
-        identity.known = true;
-        identity.size = (static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
-        identity.writeTime = FileTimeValue(info.ftLastWriteTime);
-        return identity;
-    }
-
-    FileIdentity IdentityOfPath(const std::filesystem::path& path)
-    {
-        WIN32_FILE_ATTRIBUTE_DATA data {};
-        BOOL found = GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data);
-        if (!found)
-        {
-            const DWORD error = GetLastError();
-            if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND || error == ERROR_FILENAME_EXCED_RANGE)
-            {
-                const std::wstring extended = ExtendedLengthPath(path.c_str());
-                found = !extended.empty() && GetFileAttributesExW(extended.c_str(), GetFileExInfoStandard, &data);
-            }
-        }
-        if (!found)
-        {
-            return {};
-        }
-        FileIdentity identity;
-        identity.known = true;
-        identity.size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-        identity.writeTime = FileTimeValue(data.ftLastWriteTime);
-        return identity;
-    }
 #endif
 
     std::wstring ExtensionFromFourCC(const char(&ext)[4])
@@ -1938,7 +1834,7 @@ private:
         // Of the open file (unknown once closed).
         FileIdentity Identity() const
         {
-            return m_file == INVALID_HANDLE_VALUE ? FileIdentity {} : IdentityOfHandle(m_file);
+            return m_file == INVALID_HANDLE_VALUE ? FileIdentity {} : FileIdentityOfHandle(m_file);
         }
 
         // An idle cursor: closes the file handle and keeps the position, the
@@ -1952,8 +1848,9 @@ private:
 
         // Before a suspended cursor reads again: reopens the file at the
         // position of its next block read. False when it cannot be opened or
-        // no longer has `expected` identity (it was replaced or rewritten):
-        // the cursor is then refused.
+        // no longer has `expected` identity (it was rewritten, or another file
+        // was renamed over it: its file ID differs even when its size and
+        // write time match): the cursor is then refused.
         bool Resume(const FileIdentity& expected)
         {
             if (m_file != INVALID_HANDLE_VALUE)
@@ -2193,7 +2090,7 @@ private:
         if (lease.cursor)
         {
             StopAwareSource& retained = *static_cast<Cursor&>(*lease.cursor).session.source;
-            if ((m_pathIdentity.known && IdentityOfPath(m_path) != m_pathIdentity) || !retained.Resume(m_identity))
+            if ((m_pathIdentity.known && FileIdentityOfPath(m_path) != m_pathIdentity) || !retained.Resume(m_identity))
             {
                 lease.Invalidate();
             }
@@ -2433,7 +2330,7 @@ private:
         m_identity = session.source->Identity();
         // The same file through its path: compared with the path's identity
         // when a cursor resumes, so both sides come from one kind of query.
-        m_pathIdentity = IdentityOfPath(m_path);
+        m_pathIdentity = FileIdentityOfPath(m_path);
 
         // Get format name
         const char* formatName = archive_format_name(a);
