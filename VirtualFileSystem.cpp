@@ -4,10 +4,11 @@
 #include "StringUtil.h"
 #include "FloarLog.h"
 #include <algorithm>
-#include <fstream>
 #include <memory>
 #include <system_error>
 #include <unordered_set>
+
+#include <Windows.h>
 
 namespace Floar
 {
@@ -16,6 +17,56 @@ namespace
     std::shared_ptr<IArchiveReader> GetCachedReader(const std::filesystem::path& archivePath)
     {
         return ArchiveReaderCache::Shared().Get(archivePath);
+    }
+
+    constexpr int64_t kMaxPlainFileSize = 1024 * 1024 * 1024;
+
+    struct FileHandle
+    {
+        HANDLE handle { INVALID_HANDLE_VALUE };
+        ~FileHandle()
+        {
+            if (handle != INVALID_HANDLE_VALUE)
+            {
+                CloseHandle(handle);
+            }
+        }
+    };
+
+    // The whole file, or empty: a file that cannot be opened, is empty or
+    // larger than kMaxPlainFileSize, or whose read fails or ends before the
+    // size queried at open (EOF, an OS error such as ERROR_OPERATION_ABORTED)
+    // returns no data, never a partly filled buffer.
+    std::vector<uint8_t> ReadPlainFile(const std::filesystem::path& path)
+    {
+        FileHandle file;
+        file.handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (file.handle == INVALID_HANDLE_VALUE)
+        {
+            return {};
+        }
+
+        LARGE_INTEGER size {};
+        if (!GetFileSizeEx(file.handle, &size) || size.QuadPart <= 0 || size.QuadPart > kMaxPlainFileSize)
+        {
+            return {};
+        }
+
+        std::vector<uint8_t> data(static_cast<size_t>(size.QuadPart));
+        DWORD read = 0;
+        if (!::ReadFile(file.handle, data.data(), static_cast<DWORD>(data.size()), &read, nullptr))
+        {
+            const DWORD error = GetLastError();
+            FLOAR_LOG_WARN("[VFS] Plain file read failed (error {}): {}", error, Log::ToUtf8(path));
+            return {};
+        }
+        if (read != data.size())
+        {
+            FLOAR_LOG_WARN("[VFS] Plain file ended at {} of {} bytes: {}", read, data.size(), Log::ToUtf8(path));
+            return {};
+        }
+        return data;
     }
 }
 
@@ -95,25 +146,7 @@ std::vector<uint8_t> VirtualFileSystem::ReadFile(const VirtualPath& filePath, st
         }
         return data;
     }
-    else
-    {
-        std::ifstream file(filePath.hostPath, std::ios::binary | std::ios::ate);
-        if (!file)
-        {
-            return {};
-        }
-
-        auto size = file.tellg();
-        if (size <= 0 || size > 1024 * 1024 * 1024)
-        {
-            return {};
-        }
-
-        std::vector<uint8_t> data(static_cast<size_t>(size));
-        file.seekg(0);
-        file.read(reinterpret_cast<char*>(data.data()), size);
-        return data;
-    }
+    return ReadPlainFile(filePath.hostPath);
 }
 
 bool VirtualFileSystem::Exists(const VirtualPath& path)

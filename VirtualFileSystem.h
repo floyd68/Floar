@@ -48,6 +48,10 @@ public:
         std::stop_token stop,
         const std::function<void(VirtualFileEntry&&)>& onEntry);
     // The whole file, or empty when it cannot be read. Uses ArchiveReaderCache::Shared().
+    // A plain file whose read fails or ends before the size queried when it
+    // was opened (it shrank, an OS read error, ERROR_OPERATION_ABORTED after a
+    // CancelSynchronousIo) returns empty data, never a partly filled buffer;
+    // so does an empty file or one larger than 1 GiB.
     static std::vector<uint8_t> ReadFile(const VirtualPath& filePath);
     // Stop-aware read: empty once `stop` is requested, and nothing partial is
     // returned. `stop` is checked before any work (no open, extraction or file
