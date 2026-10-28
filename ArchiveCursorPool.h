@@ -9,6 +9,7 @@
 #include <mutex>
 #include <stop_token>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Floar
@@ -56,6 +57,7 @@ struct ArchiveCursorStats
     size_t idle { 0 };
     size_t waiting { 0 };
     std::uint64_t memoryBytes { 0 };   // estimated, active + idle
+    size_t retiredOwners { 0 };        // retired (ReleaseOwner) and not yet forgotten
     size_t peakActive { 0 };
     size_t peakIdle { 0 };
     std::uint64_t peakMemoryBytes { 0 };
@@ -64,7 +66,7 @@ struct ArchiveCursorStats
     std::uint64_t restarts { 0 };      // opens while the reader had idle cursors, all past the target
     std::uint64_t resumes { 0 };       // admissions that continue a retained cursor
     std::uint64_t retained { 0 };      // cursors returned to idle at a valid boundary
-    std::uint64_t discarded { 0 };     // cursors closed after use (error, stop inside the archive, end reached, exception)
+    std::uint64_t discarded { 0 };     // cursors closed after use (error, stop inside the archive, end reached, exception, retired owner)
     std::uint64_t evicted { 0 };       // idle cursors closed by limits, timeout, TrimIdle or ReleaseOwner
     std::uint64_t invalidated { 0 };   // cursors refused because the archive file changed
     std::uint64_t waits { 0 };         // admissions that had to wait for capacity
@@ -162,8 +164,15 @@ public:
     // per-cursor estimate.
     Lease Acquire(std::uint64_t owner, size_t target, std::uint64_t memoryEstimate, ExtractPriority priority, std::stop_token stop);
 
-    // Closes every idle cursor of `owner` (its reader is gone or replaced).
+    // Retires `owner` (its reader was replaced or evicted): closes its idle
+    // cursors, and every lease of it - in use now or acquired later - ends by
+    // closing its cursor instead of retaining it. Recorded under the pool
+    // lock that returning a lease takes, so a lease returned after this call
+    // never makes a cursor of `owner` idle again.
     void ReleaseOwner(std::uint64_t owner);
+    // `owner`'s reader is destroyed (it holds no lease): closes its idle
+    // cursors and drops its retirement record.
+    void ForgetOwner(std::uint64_t owner);
     // Closes every idle cursor; returns how many.
     size_t TrimIdle();
 
@@ -217,6 +226,7 @@ private:
     std::list<Waiter*> m_highWaiters {};
     std::list<Waiter*> m_normalWaiters {};
     std::unordered_map<std::uint64_t, size_t> m_activePerOwner {};
+    std::unordered_set<std::uint64_t> m_retiredOwners {};
     size_t m_active { 0 };
     std::uint64_t m_activeMemory { 0 };
     std::uint64_t m_idleMemory { 0 };

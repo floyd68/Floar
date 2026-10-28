@@ -1612,7 +1612,6 @@ class LibArchiveReader : public IArchiveReader
     uint64_t m_cursorEstimate { 0 };   // decompressor memory per cursor (estimate)
     std::shared_ptr<ArchiveCursorPool> m_pool;
     const uint64_t m_owner;
-    std::atomic<bool> m_retainCursors { true };
 
 public:
     LibArchiveReader(const std::filesystem::path& path, std::stop_token stop, std::shared_ptr<ArchiveCursorPool> pool)
@@ -1628,7 +1627,7 @@ public:
     ~LibArchiveReader() override
     {
         // No cursor is in use: every lease belongs to a call on this reader.
-        m_pool->ReleaseOwner(m_owner);
+        m_pool->ForgetOwner(m_owner);
     }
 
     const std::vector<ArchiveEntry>& Entries() const override
@@ -1737,7 +1736,8 @@ public:
 
     void ReleaseIdleCursors() override
     {
-        m_retainCursors = false;
+        // Also covers extractions running now: the pool closes their cursors
+        // when they return them.
         m_pool->ReleaseOwner(m_owner);
     }
 
@@ -2124,7 +2124,8 @@ private:
         lease.CountProgress(headers, entries);
         // Kept only at a known position with entries left to read, without
         // its file handle while idle (StopAwareSource::Suspend).
-        const bool keep = end != PassEnd::Broken && lease.position < m_headerCount && m_retainCursors.load();
+        // A retired reader's cursor is closed by the pool instead (ReleaseOwner).
+        const bool keep = end != PassEnd::Broken && lease.position < m_headerCount;
         if (keep)
         {
             source.Suspend();

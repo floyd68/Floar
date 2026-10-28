@@ -300,7 +300,9 @@ void ArchiveCursorPool::ReleaseLease(Lease& lease, bool keep)
         m_activeMemory -= lease.m_estimate;
         if (cursor)
         {
-            if (keep)
+            // A retired owner's cursor never becomes idle, also when the owner
+            // was retired while this lease was out.
+            if (keep && !m_retiredOwners.contains(lease.m_owner))
             {
                 Idle idle;
                 idle.owner = lease.m_owner;
@@ -388,6 +390,7 @@ void ArchiveCursorPool::ReleaseOwner(std::uint64_t owner)
     Doomed doomed;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        m_retiredOwners.insert(owner);
         for (auto it = m_idle.begin(); it != m_idle.end();)
         {
             auto next = std::next(it);
@@ -400,6 +403,13 @@ void ArchiveCursorPool::ReleaseOwner(std::uint64_t owner)
         GrantLocked(doomed);
     }
     doomed.clear();
+}
+
+void ArchiveCursorPool::ForgetOwner(std::uint64_t owner)
+{
+    ReleaseOwner(owner);   // closes its idle cursors
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_retiredOwners.erase(owner);
 }
 
 size_t ArchiveCursorPool::TrimIdle()
@@ -445,6 +455,7 @@ ArchiveCursorStats ArchiveCursorPool::Stats() const
     stats.idle = m_idle.size();
     stats.waiting = m_highWaiters.size() + m_normalWaiters.size();
     stats.memoryBytes = m_activeMemory + m_idleMemory;
+    stats.retiredOwners = m_retiredOwners.size();
     return stats;
 }
 

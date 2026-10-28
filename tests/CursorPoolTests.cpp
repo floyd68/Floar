@@ -393,6 +393,67 @@ FLOAR_TEST(CursorPool_IdleLimitsAndExpiry)
     FLOAR_CHECK(g_liveCursors == 0);
 }
 
+// A reader retired (ReleaseOwner: evicted or replaced) while an extraction
+// still holds its cursor: the extraction decided to keep the cursor before
+// the retirement and returns it after ReleaseOwner completed (the controlled
+// interleaving below). The returned cursor is closed, never made idle, and
+// so are the cursors of later leases of that reader, including a lease
+// returned untouched right after it was acquired. ForgetOwner (the reader
+// is destroyed) drops the record.
+FLOAR_TEST(CursorPool_RetiredOwnerNeverRetainsAReturnedCursor)
+{
+    ArchiveCursorPool pool;
+    const auto owner = ArchiveCursorPool::NewOwnerId();
+    const auto other = ArchiveCursorPool::NewOwnerId();
+    const int liveBefore = g_liveCursors.load();
+
+    std::promise<void> leased;
+    std::promise<void> retired;
+    std::thread extraction([&]
+    {
+        auto lease = pool.Acquire(owner, 0, 1, ExtractPriority::Normal, {});
+        lease.cursor = std::make_unique<FakeCursor>(&pool);
+        lease.position = 3;
+        const bool keep = true;   // sampled before the retirement
+        leased.set_value();
+        retired.get_future().wait();
+        lease.Finish(keep);
+    });
+    leased.get_future().wait();
+    FLOAR_CHECK(pool.Stats().active == 1);
+    pool.ReleaseOwner(owner);   // completes while the cursor is leased
+    retired.set_value();
+    extraction.join();
+
+    auto stats = pool.Stats();
+    FLOAR_CHECK(pool.IdlePositions(owner).empty());
+    FLOAR_CHECK(stats.idle == 0);
+    FLOAR_CHECK(stats.active == 0);
+    FLOAR_CHECK(stats.retained == 0);
+    FLOAR_CHECK(stats.discarded == 1);
+    FLOAR_CHECK(stats.memoryBytes == 0);
+    FLOAR_CHECK(g_liveCursors == liveBefore);
+
+    // Later leases of the retired reader retain nothing either.
+    auto lease = pool.Acquire(owner, 0, 1, ExtractPriority::Normal, {});
+    Retain(lease, 2, &pool);
+    lease = pool.Acquire(owner, 0, 1, ExtractPriority::Normal, {});
+    lease.Finish(true);   // canceled right after it was acquired
+    FLOAR_CHECK(pool.IdlePositions(owner).empty());
+    // Other readers are unaffected.
+    lease = pool.Acquire(other, 0, 1, ExtractPriority::Normal, {});
+    Retain(lease, 2, &pool);
+    FLOAR_CHECK(pool.IdlePositions(other) == (std::vector<size_t> { 2 }));
+
+    FLOAR_CHECK(pool.Stats().retiredOwners == 1);
+    pool.ForgetOwner(owner);
+    pool.ForgetOwner(other);
+    stats = pool.Stats();
+    FLOAR_CHECK(stats.retiredOwners == 0);
+    FLOAR_CHECK(stats.idle == 0);
+    FLOAR_CHECK(g_liveCursors == liveBefore);
+}
+
 FLOAR_TEST(CursorPool_NestedAcquireOnTheHoldingThreadDoesNotWait)
 {
     ArchiveCursorPool pool(Limits(1, 1, 0));

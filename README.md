@@ -53,7 +53,10 @@ unless `ArchiveReaderFactory::Open` is given another pool):
   refused once the path's identity differs, and a newly opened handle whose
   file differs is not read: an old reader returns empty data rather than the
   new file's content. `ArchiveReaderCache` closes the idle cursors of a reader
-  it replaces (file changed) or evicts.
+  it replaces (file changed) or evicts, and that reader retains no cursor from
+  then on: the pool records it as retired (`ReleaseOwner`) under the lock that
+  returning a cursor takes, so a cursor still in use when it was retired is
+  closed when its extraction returns it.
 - Limits (`ArchiveCursorLimits`, `SetLimits`): active cursors process-wide
   (default 3) and per reader (2), of which `reservedForHigh` (1) only High
   requests may use, so Normal work gets 2 and 1; idle cursors process-wide (2)
