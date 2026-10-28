@@ -136,11 +136,30 @@ int main(int argc, char** argv)
         return 2;
     }
 
+    // A directory this run creates itself (CreateDirectoryW fails on an
+    // existing one, e.g. left by an interrupted run whose PID was reused), so
+    // the cleanup below never touches files this run did not write.
     wchar_t tempPath[MAX_PATH] {};
     GetTempPathW(MAX_PATH, tempPath);
-    const std::filesystem::path dir = std::filesystem::path(tempPath) /
-        (L"FloarPlainReadBench_" + std::to_wstring(GetCurrentProcessId()));
-    std::filesystem::create_directories(dir);
+    std::filesystem::path dir;
+    for (int attempt = 0; attempt < 100 && dir.empty(); ++attempt)
+    {
+        const std::filesystem::path candidate = std::filesystem::path(tempPath) /
+            (L"FloarPlainReadBench_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(attempt));
+        if (CreateDirectoryW(candidate.c_str(), nullptr))
+        {
+            dir = candidate;
+        }
+        else if (GetLastError() != ERROR_ALREADY_EXISTS)
+        {
+            break;
+        }
+    }
+    if (dir.empty())
+    {
+        std::fprintf(stderr, "could not create a fresh benchmark directory\n");
+        return 1;
+    }
 
     std::mt19937_64 rng(20261028);
     std::uniform_int_distribution<uint64_t> sizeDist(uint64_t(minMiB) << 20, uint64_t(maxMiB) << 20);
@@ -241,7 +260,11 @@ int main(int argc, char** argv)
         }
     }
 
-    std::error_code ec;
-    std::filesystem::remove_all(dir, ec);
+    // Remove only this run's files and its own directory.
+    for (const auto& file : files)
+    {
+        (void)DeleteFileW(file.path.c_str());
+    }
+    (void)RemoveDirectoryW(dir.c_str());
     return status;
 }
