@@ -1711,7 +1711,8 @@ class LibArchiveReader : public IArchiveReader
     // 7z/RAR: reading an entry decompresses the entries before it, so
     // extractions run on retained forward cursors.
     bool m_sequential { false };
-    FileIdentity m_identity {};        // of the file that was scanned
+    FileIdentity m_identity {};        // of the file that was scanned (from its handle)
+    FileIdentity m_pathIdentity {};    // of its path at the scan (checked when a cursor resumes)
     uint64_t m_cursorEstimate { 0 };   // decompressor memory per cursor (estimate)
     std::shared_ptr<ArchiveCursorPool> m_pool;
     const uint64_t m_owner;
@@ -2152,7 +2153,7 @@ private:
         }
         // A retained cursor reads the file it opened: refuse it once the path
         // names other content (replaced or rewritten since the scan).
-        if (lease.cursor && m_identity.known && IdentityOfPath(m_path) != m_identity)
+        if (lease.cursor && m_pathIdentity.known && IdentityOfPath(m_path) != m_pathIdentity)
         {
             lease.Invalidate();
         }
@@ -2383,6 +2384,9 @@ private:
             return;
         }
         m_identity = session.source->Identity();
+        // The same file through its path: compared with the path's identity
+        // when a cursor resumes, so both sides come from one kind of query.
+        m_pathIdentity = IdentityOfPath(m_path);
 
         // Get format name
         const char* formatName = archive_format_name(a);
