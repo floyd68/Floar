@@ -4,10 +4,12 @@
 #include "StringUtil.h"
 #include "FloarLog.h"
 #include <algorithm>
-#include <fstream>
 #include <memory>
+#include <mutex>
 #include <system_error>
 #include <unordered_set>
+
+#include <Windows.h>
 
 namespace Floar
 {
@@ -16,6 +18,103 @@ namespace
     std::shared_ptr<IArchiveReader> GetCachedReader(const std::filesystem::path& archivePath)
     {
         return ArchiveReaderCache::Shared().Get(archivePath);
+    }
+
+    constexpr int64_t kMaxPlainFileSize = 1024 * 1024 * 1024;
+
+    std::mutex g_plainFileReadHookMutex;
+    std::shared_ptr<const VirtualFileSystem::PlainFileReadHook> g_plainFileReadHook;
+
+    std::shared_ptr<const VirtualFileSystem::PlainFileReadHook> CurrentPlainFileReadHook()
+    {
+        std::lock_guard lock(g_plainFileReadHookMutex);
+        return g_plainFileReadHook;
+    }
+
+    struct FileHandle
+    {
+        HANDLE handle { INVALID_HANDLE_VALUE };
+        ~FileHandle()
+        {
+            if (handle != INVALID_HANDLE_VALUE)
+            {
+                CloseHandle(handle);
+            }
+        }
+    };
+
+    // The whole file, or empty: a file that cannot be opened, is empty or
+    // larger than kMaxPlainFileSize, or whose read fails or ends before the
+    // size queried at open (EOF, an OS error such as ERROR_OPERATION_ABORTED)
+    // returns no data, never a partly filled buffer. One allocation; the data
+    // is read in kPlainFileReadChunk chunks with a stop check before each one
+    // and before returning, so a stop discards the data after at most one more
+    // chunk read (which itself is not interrupted).
+    std::vector<uint8_t> ReadPlainFile(const std::filesystem::path& path, std::stop_token stop)
+    {
+        const auto hook = CurrentPlainFileReadHook();
+        if (hook && hook->beforeOpen)
+        {
+            hook->beforeOpen(path);
+        }
+
+        FileHandle file;
+        file.handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (file.handle == INVALID_HANDLE_VALUE)
+        {
+            return {};
+        }
+
+        LARGE_INTEGER size {};
+        if (!GetFileSizeEx(file.handle, &size) || size.QuadPart <= 0 || size.QuadPart > kMaxPlainFileSize)
+        {
+            return {};
+        }
+
+        std::vector<uint8_t> data(static_cast<size_t>(size.QuadPart));
+        size_t offset = 0;
+        while (offset < data.size())
+        {
+            if (stop.stop_requested())
+            {
+                return {};
+            }
+            const DWORD chunk = static_cast<DWORD>((std::min)(data.size() - offset, VirtualFileSystem::kPlainFileReadChunk));
+            DWORD read = 0;
+            DWORD error = ERROR_SUCCESS;
+            if (hook && hook->beforeChunk)
+            {
+                error = hook->beforeChunk(offset, chunk);
+            }
+            if (error == ERROR_SUCCESS && !::ReadFile(file.handle, data.data() + offset, chunk, &read, nullptr))
+            {
+                error = GetLastError();
+            }
+            if (error == ERROR_OPERATION_ABORTED)
+            {
+                // The caller's CancelSynchronousIo.
+                FLOAR_LOG_DEBUG("[VFS] Plain file read aborted at {} of {} bytes: {}", offset, data.size(), Log::ToUtf8(path));
+                return {};
+            }
+            if (error != ERROR_SUCCESS)
+            {
+                FLOAR_LOG_WARN("[VFS] Plain file read failed at {} of {} bytes (error {}): {}",
+                    offset, data.size(), error, Log::ToUtf8(path));
+                return {};
+            }
+            offset += read;
+            if (read != chunk)
+            {
+                FLOAR_LOG_WARN("[VFS] Plain file ended at {} of {} bytes: {}", offset, data.size(), Log::ToUtf8(path));
+                return {};
+            }
+        }
+        if (stop.stop_requested())
+        {
+            return {};
+        }
+        return data;
     }
 }
 
@@ -47,6 +146,17 @@ bool VirtualFileSystem::EnumerateDirectory(
         return EnumerateArchive(dirPath.hostPath, std::wstring(), stop, onEntry);
     }
     return EnumerateFilesystem(dirPath.hostPath, stop, onEntry);
+}
+
+void VirtualFileSystem::SetPlainFileReadHook(PlainFileReadHook hook)
+{
+    std::shared_ptr<const PlainFileReadHook> installed;
+    if (hook.beforeOpen || hook.beforeChunk)
+    {
+        installed = std::make_shared<const PlainFileReadHook>(std::move(hook));
+    }
+    std::lock_guard lock(g_plainFileReadHookMutex);
+    g_plainFileReadHook = std::move(installed);
 }
 
 std::vector<uint8_t> VirtualFileSystem::ReadFile(const VirtualPath& filePath)
@@ -95,25 +205,7 @@ std::vector<uint8_t> VirtualFileSystem::ReadFile(const VirtualPath& filePath, st
         }
         return data;
     }
-    else
-    {
-        std::ifstream file(filePath.hostPath, std::ios::binary | std::ios::ate);
-        if (!file)
-        {
-            return {};
-        }
-
-        auto size = file.tellg();
-        if (size <= 0 || size > 1024 * 1024 * 1024)
-        {
-            return {};
-        }
-
-        std::vector<uint8_t> data(static_cast<size_t>(size));
-        file.seekg(0);
-        file.read(reinterpret_cast<char*>(data.data()), size);
-        return data;
-    }
+    return ReadPlainFile(filePath.hostPath, stop);
 }
 
 bool VirtualFileSystem::Exists(const VirtualPath& path)

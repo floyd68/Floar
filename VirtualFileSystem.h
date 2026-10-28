@@ -1,6 +1,9 @@
 #pragma once
 
 #include "VirtualPath.h"
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <stop_token>
 #include <vector>
@@ -31,6 +34,9 @@ struct VirtualFileEntry
 class VirtualFileSystem
 {
 public:
+    // Plain files are read in chunks of this size, with a stop check between them.
+    static constexpr size_t kPlainFileReadChunk = 2 * 1024 * 1024;
+
     static std::vector<VirtualFileEntry> ListDirectory(const VirtualPath& dirPath);
 
     // Streams the children of `dirPath` (a folder, an archive, or a folder in
@@ -48,6 +54,10 @@ public:
         std::stop_token stop,
         const std::function<void(VirtualFileEntry&&)>& onEntry);
     // The whole file, or empty when it cannot be read. Uses ArchiveReaderCache::Shared().
+    // A plain file whose read fails or ends before the size queried when it
+    // was opened (it shrank, an OS read error, ERROR_OPERATION_ABORTED after a
+    // CancelSynchronousIo) returns empty data, never a partly filled buffer;
+    // so does an empty file or one larger than 1 GiB.
     static std::vector<uint8_t> ReadFile(const VirtualPath& filePath);
     // Stop-aware read: empty once `stop` is requested, and nothing partial is
     // returned. `stop` is checked before any work (no open, extraction or file
@@ -64,10 +74,32 @@ public:
     // interrupted by a stop check. Extraction and plain-file reads
     // run on the calling thread (its owner may add CancelSynchronousIo); the
     // archive open runs on a cache worker. Plain files: stop is checked before
-    // the file is opened; the read itself is not interrupted.
+    // the file is opened, then the file is read into one buffer in
+    // kPlainFileReadChunk chunks with a stop check before each chunk and
+    // before the data is returned, so a stop returns empty data after at most
+    // one more chunk. One chunk's OS read can still block for its whole
+    // duration (a network path, an online-only OneDrive file) and is not
+    // interrupted by a stop check; only the caller's CancelSynchronousIo on
+    // this thread can end it (the read then fails and returns empty data).
     static std::vector<uint8_t> ReadFile(const VirtualPath& filePath, std::stop_token stop);
     // The same, with archive readers from `cache` (an injected opener in tests).
     static std::vector<uint8_t> ReadFile(const VirtualPath& filePath, std::stop_token stop, ArchiveReaderCache& cache);
+    // Test seam for plain-file reads (both ReadFile overloads), process-wide:
+    // install it only while no other plain-file read runs, and clear it by
+    // installing an empty hook. Both callbacks are optional and run on the
+    // reading thread.
+    struct PlainFileReadHook
+    {
+        // Before the file is opened.
+        std::function<void(const std::filesystem::path& path)> beforeOpen;
+        // Before every chunk read, with the chunk's file offset and size. It
+        // may change the file (for example truncate it). A nonzero result is a
+        // Win32 error code that fails this chunk read in place of the OS read
+        // (for example ERROR_OPERATION_ABORTED).
+        std::function<uint32_t(uint64_t offset, size_t size)> beforeChunk;
+    };
+    static void SetPlainFileReadHook(PlainFileReadHook hook);
+
     static bool Exists(const VirtualPath& path);
     static bool IsDirectory(const VirtualPath& path);
 
