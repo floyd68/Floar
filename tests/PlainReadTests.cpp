@@ -35,10 +35,22 @@ namespace
     {
         wchar_t tempPath[MAX_PATH] {};
         GetTempPathW(MAX_PATH, tempPath);
-        const std::filesystem::path dir = std::filesystem::path(tempPath) /
-            (L"FloarPlain_" + std::to_wstring(GetCurrentProcessId()) + L"_" + tag + L"_" + std::to_wstring(GetTickCount64()));
-        std::filesystem::create_directories(dir);
-        return dir;
+        // A directory created by this call (CreateDirectoryW fails on an
+        // existing one), so ScopedDir's cleanup removes only test files.
+        for (int attempt = 0; attempt < 100; ++attempt)
+        {
+            const std::filesystem::path dir = std::filesystem::path(tempPath) /
+                (L"FloarPlain_" + std::to_wstring(GetCurrentProcessId()) + L"_" + tag + L"_" + std::to_wstring(attempt));
+            if (CreateDirectoryW(dir.c_str(), nullptr))
+            {
+                return dir;
+            }
+            if (GetLastError() != ERROR_ALREADY_EXISTS)
+            {
+                break;
+            }
+        }
+        return {};
     }
 
     struct ScopedDir
@@ -122,6 +134,7 @@ namespace
 FLOAR_TEST(Plain_ShrinkingFileReturnsEmptyInBothOverloads)
 {
     ScopedDir dir { TempDir(L"shrink") };
+    FLOAR_REQUIRE(!dir.path.empty());
     const size_t size = 2 * kChunk + kChunk / 2;
     const auto original = Pattern(size);
 
@@ -163,6 +176,7 @@ FLOAR_TEST(Plain_ShrinkingFileReturnsEmptyInBothOverloads)
 FLOAR_TEST(Plain_MidReadFailureReturnsEmptyInBothOverloads)
 {
     ScopedDir dir { TempDir(L"fail") };
+    FLOAR_REQUIRE(!dir.path.empty());
     const size_t size = 3 * kChunk + 12345;
     const auto path = WriteBytes(dir.path / L"fail.bin", Pattern(size));
 
@@ -202,6 +216,7 @@ FLOAR_TEST(Plain_MidReadFailureReturnsEmptyInBothOverloads)
 FLOAR_TEST(Plain_PreCanceledReadOpensNothing)
 {
     ScopedDir dir { TempDir(L"pre") };
+    FLOAR_REQUIRE(!dir.path.empty());
     const auto path = WriteBytes(dir.path / L"pre.bin", Pattern(kChunk + 1));
     std::atomic<int> opens { 0 };
     std::atomic<int> chunks { 0 };
@@ -221,6 +236,7 @@ FLOAR_TEST(Plain_PreCanceledReadOpensNothing)
 FLOAR_TEST(Plain_StopBetweenChunksReturnsEmptyAfterAtMostOneMoreChunk)
 {
     ScopedDir dir { TempDir(L"stop") };
+    FLOAR_REQUIRE(!dir.path.empty());
     const size_t size = 4 * kChunk + 777;
     const int chunkCount = 5;
     const auto path = WriteBytes(dir.path / L"stop.bin", Pattern(size));
@@ -269,10 +285,20 @@ FLOAR_TEST(Plain_StopBetweenChunksReturnsEmptyAfterAtMostOneMoreChunk)
             return ERROR_SUCCESS;
         } });
         auto read = std::async(std::launch::async, [&] { return VirtualFileSystem::ReadFile(VirtualPath(path), stop.get_token()); });
-        FLOAR_REQUIRE(holding.get_future().wait_for(10s) == std::future_status::ready);
+        // Nothing may throw while the future is pending (its destructor waits
+        // for the reader): the gate is released whatever happened, and a
+        // reader that still does not return ends the process instead of
+        // hanging it (it captures this scope, so it cannot be detached).
+        const bool held = holding.get_future().wait_for(10s) == std::future_status::ready;
         stop.request_stop();
         release.set_value();
-        FLOAR_REQUIRE(read.wait_for(10s) == std::future_status::ready);
+        if (read.wait_for(10s) != std::future_status::ready)
+        {
+            std::fprintf(stderr, "  FATAL: the stopped plain-file read did not return within 10 s\n");
+            std::fflush(stderr);
+            TerminateProcess(GetCurrentProcess(), 3);
+        }
+        FLOAR_CHECK(held);
         FLOAR_CHECK(read.get().empty());
         FLOAR_CHECK(chunks == 2);
     }
@@ -284,6 +310,7 @@ FLOAR_TEST(Plain_StopBetweenChunksReturnsEmptyAfterAtMostOneMoreChunk)
 FLOAR_TEST(Plain_NormalReadsReturnUnchangedBytes)
 {
     ScopedDir dir { TempDir(L"bytes") };
+    FLOAR_REQUIRE(!dir.path.empty());
     std::stop_source live;
     std::vector<std::pair<const char*, ReadFn>> reads = BothOverloads();
     reads.emplace_back("ReadFile(path, live stop)",
