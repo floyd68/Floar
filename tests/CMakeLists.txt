@@ -8,6 +8,8 @@ add_executable(FloarTests
     TestMain.cpp
     Ba2Tests.cpp
     CancelReadTests.cpp
+    CursorPoolTests.cpp
+    CursorTests.cpp
     LogTests.cpp
     OpenPoolTests.cpp
     PlainReadTests.cpp
@@ -51,8 +53,11 @@ add_test(NAME Floar.Streaming COMMAND FloarTests Stream)
 add_test(NAME Floar.OpenPool COMMAND FloarTests Pool_)
 add_test(NAME Floar.CancelRead COMMAND FloarTests Cancel_)
 add_test(NAME Floar.PlainRead COMMAND FloarTests Plain_)
+add_test(NAME Floar.CursorPool COMMAND FloarTests CursorPool_)
+add_test(NAME Floar.CursorRead COMMAND FloarTests CursorRead_)
 # Safety net only: the tests contain no unbounded waits.
-set_tests_properties(Floar.Log Floar.Vfs Floar.Ba2 Floar.Streaming Floar.OpenPool Floar.CancelRead Floar.PlainRead PROPERTIES TIMEOUT 120)
+set_tests_properties(Floar.Log Floar.Vfs Floar.Ba2 Floar.Streaming Floar.OpenPool Floar.CancelRead Floar.PlainRead
+    Floar.CursorPool Floar.CursorRead PROPERTIES TIMEOUT 120)
 
 # Opt-in plain-file read throughput benchmark; not registered with ctest.
 add_executable(FloarPlainReadBench PlainReadBenchmark.cpp)
@@ -60,4 +65,12 @@ target_compile_definitions(FloarPlainReadBench PRIVATE UNICODE _UNICODE)
 target_link_libraries(FloarPlainReadBench PRIVATE Floar)
 if(MSVC)
     target_compile_options(FloarPlainReadBench PRIVATE /permissive- /utf-8)
+endif()
+
+# Opt-in forward-cursor benchmark for solid archives; not registered with ctest.
+add_executable(FloarSolidCursorBench SolidCursorBenchmark.cpp)
+target_compile_definitions(FloarSolidCursorBench PRIVATE UNICODE _UNICODE)
+target_link_libraries(FloarSolidCursorBench PRIVATE Floar psapi)
+if(MSVC)
+    target_compile_options(FloarSolidCursorBench PRIVATE /permissive- /utf-8)
 endif()

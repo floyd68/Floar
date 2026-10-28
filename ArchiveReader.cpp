@@ -1,6 +1,7 @@
 #include "ArchiveReader.h"
 #include "ArchiveTypes.h"
 #include "StringUtil.h"
+#include "FileIdentity.h"
 #include "FloarLog.h"
 #include "VirtualPath.h"
 
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <Windows.h>
@@ -198,61 +200,17 @@ namespace
         std::unordered_set<std::wstring> m_directories {};
     };
 
-    // The full path of `path` with the \\?\ (or \\?\UNC\) prefix, which lifts
-    // the MAX_PATH limit; empty when it has no such form. The same conversion
-    // as libarchive's __la_win_permissive_name_w.
-    std::wstring ExtendedLengthPath(const wchar_t* path)
-    {
-        const DWORD needed = GetFullPathNameW(path, 0, nullptr, nullptr);
-        if (needed == 0)
-        {
-            return {};
-        }
-        std::wstring full(static_cast<size_t>(needed) + 3, L'\0');
-        const DWORD length = GetFullPathNameW(path, static_cast<DWORD>(full.size()), full.data(), nullptr);
-        if (length == 0 || length >= full.size())
-        {
-            return {};
-        }
-        full.resize(length);
-
-        if (full.starts_with(L"\\\\?\\"))
-        {
-            return full;   // already extended
-        }
-        if (full.starts_with(L"\\\\.\\"))
-        {
-            // A device path; \\.\C:\ names a drive like \\?\C:\ does.
-            if (full.size() >= 7 && ((full[4] >= L'a' && full[4] <= L'z') || (full[4] >= L'A' && full[4] <= L'Z')) && full[5] == L':' && full[6] == L'\\')
-            {
-                full[2] = L'?';
-                return full;
-            }
-            return {};
-        }
-        if (full.starts_with(L"\\\\"))
-        {
-            // \\server\share\... -> \\?\UNC\server\share\...
-            const size_t share = full.find(L'\\', 2);
-            if (share == std::wstring::npos || share == 2)
-            {
-                return {};
-            }
-            const size_t rest = full.find(L'\\', share + 1);
-            if (rest == std::wstring::npos || rest == share + 1)
-            {
-                return {};
-            }
-            return L"\\\\?\\UNC\\" + full.substr(2);
-        }
-        return L"\\\\?\\" + full;
-    }
-
     std::atomic<size_t> g_statusQueries { 0 };
     std::atomic<size_t> g_opens { 0 };
     std::atomic<size_t> g_dataHandleOpens { 0 };
     std::atomic<size_t> g_extractionHeaders { 0 };
     std::atomic<size_t> g_sourceBytes { 0 };
+
+#if FLOAR_ENABLE_COMMON_ARCHIVES
+    // SetLibArchiveReadHookForTesting: installed only while no read runs.
+    std::function<bool(uint64_t)> g_readHook;
+    std::atomic<bool> g_hasReadHook { false };
+#endif
 
     std::wstring ExtensionFromFourCC(const char(&ext)[4])
     {
@@ -1642,14 +1600,34 @@ class LibArchiveReader : public IArchiveReader
     std::unordered_map<std::wstring, size_t> m_entryMap;
     DirectoryIndex m_directories;
     std::wstring m_formatName;
+    // Archive order of each entry: the ordinal of the first header with its
+    // original name, which is the header an extraction of that name reads.
+    std::vector<size_t> m_entryOrdinal;
+    size_t m_headerCount { 0 };
+    // 7z/RAR: reading an entry decompresses the entries before it, so
+    // extractions run on retained forward cursors.
+    bool m_sequential { false };
+    FileIdentity m_identity {};        // of the file that was scanned (from its handle)
+    FileIdentity m_pathIdentity {};    // of its path at the scan (checked when a cursor resumes)
+    uint64_t m_cursorEstimate { 0 };   // decompressor memory per cursor (estimate)
+    std::shared_ptr<ArchiveCursorPool> m_pool;
+    const uint64_t m_owner;
 
 public:
-    LibArchiveReader(const std::filesystem::path& path, std::stop_token stop)
+    LibArchiveReader(const std::filesystem::path& path, std::stop_token stop, std::shared_ptr<ArchiveCursorPool> pool)
         : m_path(path)
+        , m_pool(pool ? std::move(pool) : ArchiveCursorPool::Shared())
+        , m_owner(ArchiveCursorPool::NewOwnerId())
     {
         FLOAR_LOG_INFO("[LibArchiveReader] Opening: {}", Log::ToUtf8(path));
         ScanArchive(stop);
         FLOAR_LOG_INFO("[LibArchiveReader] Scanned, found {} entries", m_entries.size());
+    }
+
+    ~LibArchiveReader() override
+    {
+        // No cursor is in use: every lease belongs to a call on this reader.
+        m_pool->ForgetOwner(m_owner);
     }
 
     const std::vector<ArchiveEntry>& Entries() const override
@@ -1674,14 +1652,27 @@ public:
         return result;
     }
 
-    // One sequential scan for the whole batch: entries are matched by their
-    // original names and read as the scan reaches them; the scan ends once every
-    // requested entry was found.
     bool ExtractBatch(const std::vector<std::wstring>& entryPaths, std::stop_token stop, const BatchSink& onEntry) override
     {
+        return ExtractForward(entryPaths, stop, [&](const std::wstring& path, std::vector<uint8_t>&& data)
+        {
+            onEntry(path, std::move(data));
+            return true;
+        }, ExtractOptions {}) == ExtractResult::Completed;
+    }
+
+    // One forward pass for the whole batch: entries are read in archive order
+    // as the pass reaches them, and the pass ends after the last one. 7z/RAR
+    // run it on a cursor from the pool; ZIP opens the archive per call.
+    ExtractResult ExtractForward(
+        const std::vector<std::wstring>& entryPaths,
+        std::stop_token stop,
+        const ForwardSink& onEntry,
+        const ExtractOptions& options) override
+    {
         std::vector<bool> delivered(entryPaths.size(), false);
-        // Original (UTF-8) entry name -> indexes of the requests naming it.
-        std::unordered_map<std::string, std::vector<size_t>> wanted;
+        // Header ordinal -> the entry's original name and the requests naming it.
+        std::map<size_t, Target> targets;
         for (size_t i = 0; i < entryPaths.size(); ++i)
         {
             auto it = m_entryMap.find(ArchiveInnerPathKey(entryPaths[i]));
@@ -1693,83 +1684,61 @@ public:
                 }
                 continue;   // delivered empty below
             }
-            wanted[WideToUtf8(m_entries[it->second].name)].push_back(i);
+            Target& target = targets[m_entryOrdinal[it->second]];
+            if (target.requests.empty())
+            {
+                target.name = WideToUtf8(m_entries[it->second].name);
+            }
+            target.requests.push_back(i);
         }
 
-        if (!wanted.empty() && !stop.stop_requested())
+        if (!targets.empty() && !stop.stop_requested())
         {
-            // Owned: freed even when a callback throws.
-            const ArchiveSession session = OpenForReading(stop);
-            if (session.handle)
+            const Pass pass { entryPaths, delivered, onEntry, stop };
+            const PassEnd end = m_sequential
+                ? PassOnCursor(targets, pass, options.priority)
+                : PassOnNewHandle(targets, pass);
+            if (end == PassEnd::EndedBySink)
             {
-                struct archive* a = session.handle.get();
-                struct archive_entry* archiveEntry;
-                while (!wanted.empty())
-                {
-                    if (stop.stop_requested())
-                    {
-                        break;   // entry boundary
-                    }
-                    // May decompress the entries it skips (solid archives);
-                    // the source checks stop before every block it reads.
-                    if (archive_read_next_header(a, &archiveEntry) != ARCHIVE_OK)
-                    {
-                        break;
-                    }
-                    ++g_extractionHeaders;
-                    // UTF-8 view, independent of the CRT locale (see ScanArchive).
-                    const char* name = archive_entry_pathname_utf8(archiveEntry);
-                    if (!name)
-                    {
-                        continue;
-                    }
-                    auto found = wanted.find(name);
-                    if (found == wanted.end())
-                    {
-                        continue;
-                    }
-
-                    std::vector<uint8_t> data = ReadCurrentEntry(a, archiveEntry, stop);
-                    if (stop.stop_requested())
-                    {
-                        break;   // a partial entry is never delivered
-                    }
-                    const std::vector<size_t> requests = std::move(found->second);
-                    wanted.erase(found);
-                    for (size_t k = 0; k < requests.size(); ++k)
-                    {
-                        if (stop.stop_requested())
-                        {
-                            break;   // also between aliases of one entry
-                        }
-                        const size_t index = requests[k];
-                        delivered[index] = true;
-                        if (k + 1 == requests.size())
-                        {
-                            onEntry(entryPaths[index], std::move(data));
-                        }
-                        else
-                        {
-                            onEntry(entryPaths[index], std::vector<uint8_t>(data));
-                        }
-                    }
-                }
+                return ExtractResult::EndedBySink;
             }
         }
 
-        // Missing, directory, or not reached by the scan: empty data.
+        // Missing, directory, or not reached by the pass: empty data.
         for (size_t i = 0; i < entryPaths.size(); ++i)
         {
             if (stop.stop_requested())
             {
-                return false;
+                return ExtractResult::Stopped;
             }
-            if (!delivered[i])
+            if (!delivered[i] && !onEntry(entryPaths[i], {}))
             {
-                onEntry(entryPaths[i], {});
+                return ExtractResult::EndedBySink;
             }
         }
-        return !stop.stop_requested();
+        return stop.stop_requested() ? ExtractResult::Stopped : ExtractResult::Completed;
+    }
+
+    bool HasExpensiveRandomAccess() const override
+    {
+        return m_sequential;
+    }
+
+    size_t ArchiveOrder(const std::wstring& entryPath) const override
+    {
+        auto it = m_entryMap.find(ArchiveInnerPathKey(entryPath));
+        if (it == m_entryMap.end() || m_entries[it->second].isDirectory)
+        {
+            return kNoArchiveOrder;
+        }
+        return m_entryOrdinal[it->second];
+    }
+
+    void ReleaseIdleCursors() override
+    {
+        // Also covers extractions running now: the pool closes their cursors
+        // when they return them.
+        m_pool->ReleaseOwner(m_owner);
     }
 
     bool HasEntry(const std::wstring& entryPath) override
@@ -1798,6 +1767,7 @@ private:
     // every entry before the requested one in a solid block, which otherwise
     // runs inside a single archive_read_data call with no reachable check.
     // Skips and seeks stay seeks. Not interruptible: the block read in progress.
+    // A cursor's source gets the stop token of each extraction that leases it.
     class StopAwareSource
     {
     public:
@@ -1817,6 +1787,11 @@ private:
         StopAwareSource(const StopAwareSource&) = delete;
         StopAwareSource& operator=(const StopAwareSource&) = delete;
 
+        void SetStop(std::stop_token stop)
+        {
+            m_stop = std::move(stop);
+        }
+
         // Wide open: libarchive reads a narrow path in the active code page on
         // Windows, which cannot name files outside it. The sharing mode matches
         // the CRT open libarchive's own file reader uses. Like that reader, a
@@ -1824,6 +1799,7 @@ private:
         // paths longer than MAX_PATH open.
         bool OpenFile(const std::filesystem::path& path)
         {
+            m_path = path;
             m_file = OpenForRead(path.c_str());
             if (m_file == INVALID_HANDLE_VALUE)
             {
@@ -1855,6 +1831,46 @@ private:
             return archive_read_open1(a);
         }
 
+        // Of the open file (unknown once closed).
+        FileIdentity Identity() const
+        {
+            return m_file == INVALID_HANDLE_VALUE ? FileIdentity {} : FileIdentityOfHandle(m_file);
+        }
+
+        // An idle cursor: closes the file handle and keeps the position, the
+        // block buffer (libarchive may still consume the last block) and the
+        // decompressor state, so the archive can be renamed over or deleted
+        // while the cursor is retained.
+        void Suspend()
+        {
+            Close();
+        }
+
+        // Before a suspended cursor reads again: reopens the file at the
+        // position of its next block read. False when it cannot be opened or
+        // no longer has `expected` identity (it was rewritten, or another file
+        // was renamed over it: its file ID differs even when its size and
+        // write time match): the cursor is then refused.
+        bool Resume(const FileIdentity& expected)
+        {
+            if (m_file != INVALID_HANDLE_VALUE)
+            {
+                return true;
+            }
+            if (!OpenFile(m_path))
+            {
+                return false;
+            }
+            LARGE_INTEGER distance {};
+            distance.QuadPart = static_cast<LONGLONG>(m_offset);
+            if ((expected.known && Identity() != expected) || !SetFilePointerEx(m_file, distance, nullptr, FILE_BEGIN))
+            {
+                Close();
+                return false;
+            }
+            return true;
+        }
+
     private:
         static HANDLE OpenForRead(const wchar_t* path)
         {
@@ -1865,6 +1881,11 @@ private:
         static la_ssize_t ReadBlock(struct archive* a, void* data, const void** block)
         {
             auto* self = static_cast<StopAwareSource*>(data);
+            if (g_hasReadHook.load() && g_readHook && g_readHook(self->m_offset))
+            {
+                archive_set_error(a, EIO, "Read failed");
+                return -1;
+            }
             if (self->m_stop.stop_requested())
             {
                 archive_set_error(a, ECANCELED, "Stopped");
@@ -1877,6 +1898,7 @@ private:
                 return -1;
             }
             g_sourceBytes += read;
+            self->m_offset += read;
             *block = self->m_buffer.data();
             return static_cast<la_ssize_t>(read);
         }
@@ -1886,8 +1908,14 @@ private:
             auto* self = static_cast<StopAwareSource*>(data);
             LARGE_INTEGER distance {};
             distance.QuadPart = request;
+            LARGE_INTEGER position {};
             // 0: libarchive reads the bytes instead.
-            return SetFilePointerEx(self->m_file, distance, nullptr, FILE_CURRENT) ? request : 0;
+            if (!SetFilePointerEx(self->m_file, distance, &position, FILE_CURRENT))
+            {
+                return 0;
+            }
+            self->m_offset = static_cast<uint64_t>(position.QuadPart);
+            return request;
         }
 
         static la_int64_t SeekTo(struct archive* a, void* data, la_int64_t offset, int whence)
@@ -1902,6 +1930,7 @@ private:
                 archive_set_error(a, EIO, "Seek failed");
                 return ARCHIVE_FATAL;
             }
+            self->m_offset = static_cast<uint64_t>(position.QuadPart);
             return position.QuadPart;
         }
 
@@ -1922,7 +1951,9 @@ private:
 
         std::stop_token m_stop;
         std::vector<char> m_buffer;
+        std::filesystem::path m_path {};
         HANDLE m_file { INVALID_HANDLE_VALUE };
+        uint64_t m_offset { 0 };   // file position of the next block read
     };
 
     // The source outlives the handle: archive_read_free may still close it.
@@ -1931,6 +1962,43 @@ private:
         std::unique_ptr<StopAwareSource> source {};
         ArchiveHandle handle {};
         bool opened { false };   // positioned before the first header
+    };
+
+    // A retained forward cursor: an archive handle positioned after the
+    // headers it consumed (the lease's position).
+    class Cursor final : public ArchiveCursorPool::Cursor
+    {
+    public:
+        explicit Cursor(ArchiveSession&& opened)
+            : session(std::move(opened))
+        {
+        }
+
+        ArchiveSession session;
+    };
+
+    struct Target
+    {
+        std::string name;                 // original (UTF-8) name, checked against the header
+        std::vector<size_t> requests {};  // indexes into the request
+    };
+
+    // One extraction call's request, deliveries and callback.
+    struct Pass
+    {
+        const std::vector<std::wstring>& entryPaths;
+        std::vector<bool>& delivered;
+        const ForwardSink& onEntry;
+        std::stop_token stop;
+    };
+
+    enum class PassEnd
+    {
+        Done,                // every target was delivered; the handle is after the last one
+        EndedBySink,         // the sink ended it; the handle is after that entry
+        StoppedAtBoundary,   // stop seen between libarchive calls; the handle is after its last header
+        Broken,              // a libarchive call failed or was stopped, EOF before a target, a
+                             // header that is not the scanned one, or the open failed: no known position
     };
 
     // Formats and filters for ZIP/7z/RAR, read from `m_path` through a
@@ -1984,13 +2052,169 @@ private:
         return session;
     }
 
+    // ZIP: a handle of its own for this call, from the first header.
+    PassEnd PassOnNewHandle(std::map<size_t, Target>& targets, const Pass& pass) const
+    {
+        // Owned: freed even when a callback throws.
+        const ArchiveSession session = OpenForReading(pass.stop);
+        if (!session.handle)
+        {
+            return PassEnd::Broken;
+        }
+        size_t position = 0;
+        size_t headers = 0;
+        size_t entries = 0;
+        return RunPass(session.handle.get(), position, targets, pass, headers, entries);
+    }
+
+    // 7z/RAR: on a cursor leased from the pool - a retained one of this reader
+    // not past the first target (continued without reopening), or a new one.
+    PassEnd PassOnCursor(std::map<size_t, Target>& targets, const Pass& pass, ExtractPriority priority) const
+    {
+        // Ended (and the cursor closed) by the destructor unless finished
+        // below, so a throwing callback leaves no cursor at an unknown position.
+        ArchiveCursorPool::Lease lease = m_pool->Acquire(m_owner, targets.begin()->first, m_cursorEstimate, priority, pass.stop);
+        if (!lease)
+        {
+            return PassEnd::StoppedAtBoundary;   // stopped while waiting for capacity
+        }
+        if (pass.stop.stop_requested())
+        {
+            lease.Finish(true);   // a resumed cursor was not touched
+            return PassEnd::StoppedAtBoundary;
+        }
+        // A retained cursor reads the file it opened: refuse it once the path
+        // names other content (replaced or rewritten since the scan), or when
+        // its file, closed while it was idle, cannot be reopened as the one
+        // that was scanned.
+        if (lease.cursor)
+        {
+            StopAwareSource& retained = *static_cast<Cursor&>(*lease.cursor).session.source;
+            if ((m_pathIdentity.known && FileIdentityOfPath(m_path) != m_pathIdentity) || !retained.Resume(m_identity))
+            {
+                lease.Invalidate();
+            }
+        }
+        if (!lease.cursor)
+        {
+            ArchiveSession session = OpenForReading(pass.stop);
+            if (!session.handle)
+            {
+                lease.Finish(false);
+                return PassEnd::Broken;
+            }
+            if (m_identity.known && session.source->Identity() != m_identity)
+            {
+                FLOAR_LOG_WARN("[LibArchiveReader] Archive changed since it was scanned: {}", Log::ToUtf8(m_path));
+                lease.CountInvalidated();
+                lease.Finish(false);
+                return PassEnd::Broken;   // never serve the replacement's content
+            }
+            lease.cursor = std::make_unique<Cursor>(std::move(session));
+            lease.position = 0;
+        }
+
+        StopAwareSource& source = *static_cast<Cursor&>(*lease.cursor).session.source;
+        struct archive* a = static_cast<Cursor&>(*lease.cursor).session.handle.get();
+        source.SetStop(pass.stop);
+        size_t headers = 0;
+        size_t entries = 0;
+        const PassEnd end = RunPass(a, lease.position, targets, pass, headers, entries);
+        source.SetStop({});
+        lease.CountProgress(headers, entries);
+        // Kept only at a known position with entries left to read, without
+        // its file handle while idle (StopAwareSource::Suspend).
+        // A retired reader's cursor is closed by the pool instead (ReleaseOwner).
+        const bool keep = end != PassEnd::Broken && lease.position < m_headerCount;
+        if (keep)
+        {
+            source.Suspend();
+        }
+        lease.Finish(keep);
+        return end;
+    }
+
+    // Reads forward from header `position` (the handle's position) to each
+    // target in turn and delivers it; `position` follows the headers consumed.
+    static PassEnd RunPass(struct archive* a, size_t& position, std::map<size_t, Target>& targets, const Pass& pass, size_t& headers, size_t& entries)
+    {
+        for (auto target = targets.begin(); target != targets.end(); target = targets.erase(target))
+        {
+            if (position > target->first)
+            {
+                return PassEnd::Broken;   // never: callers start at or before the first target
+            }
+            struct archive_entry* archiveEntry = nullptr;
+            while (position <= target->first)
+            {
+                if (pass.stop.stop_requested())
+                {
+                    return PassEnd::StoppedAtBoundary;   // entry boundary
+                }
+                // May decompress the entries it skips (solid archives); the
+                // source checks stop before every block it reads.
+                if (archive_read_next_header(a, &archiveEntry) != ARCHIVE_OK)
+                {
+                    return PassEnd::Broken;
+                }
+                ++g_extractionHeaders;
+                ++headers;
+                ++position;
+            }
+            // UTF-8 view, independent of the CRT locale (see ScanArchive).
+            const char* name = archive_entry_pathname_utf8(archiveEntry);
+            if (!name || target->second.name != name)
+            {
+                return PassEnd::Broken;   // not the archive that was scanned
+            }
+
+            EntryRead read = ReadCurrentEntry(a, archiveEntry, pass.stop);
+            if (read.failed)
+            {
+                return PassEnd::Broken;
+            }
+            if (pass.stop.stop_requested())
+            {
+                // A partial entry is never delivered. libarchive skips the
+                // rest of this entry at the next header.
+                return PassEnd::StoppedAtBoundary;
+            }
+            ++entries;
+            const std::vector<size_t>& requests = target->second.requests;
+            for (size_t k = 0; k < requests.size(); ++k)
+            {
+                if (pass.stop.stop_requested())
+                {
+                    return PassEnd::StoppedAtBoundary;   // also between aliases of one entry
+                }
+                const size_t index = requests[k];
+                pass.delivered[index] = true;
+                const bool more = (k + 1 == requests.size())
+                    ? pass.onEntry(pass.entryPaths[index], std::move(read.data))
+                    : pass.onEntry(pass.entryPaths[index], std::vector<uint8_t>(read.data));
+                if (!more)
+                {
+                    return PassEnd::EndedBySink;
+                }
+            }
+        }
+        return PassEnd::Done;
+    }
+
+    struct EntryRead
+    {
+        std::vector<uint8_t> data {};
+        bool failed { false };   // a libarchive read failed: the handle has no known position
+    };
+
     // Reads the data of the entry whose header was just read (empty on
     // failure, for entries over 1 GB, or once `stop` is requested: it is
     // checked between read chunks).
-    static std::vector<uint8_t> ReadCurrentEntry(struct archive* a, struct archive_entry* archiveEntry, std::stop_token stop)
+    static EntryRead ReadCurrentEntry(struct archive* a, struct archive_entry* archiveEntry, std::stop_token stop)
     {
         constexpr size_t kStopCheckChunk = 1024 * 1024;
-        std::vector<uint8_t> result;
+        EntryRead read;
+        std::vector<uint8_t>& result = read.data;
         la_int64_t size = archive_entry_size(archiveEntry);
 
         if (size > 0 && size < 1024 * 1024 * 1024) // Max 1GB
@@ -2008,7 +2232,12 @@ private:
                     a,
                     result.data() + totalRead,
                     (std::min)(result.size() - totalRead, kStopCheckChunk));
-                if (chunkRead <= 0)
+                if (chunkRead < 0)
+                {
+                    read.failed = true;
+                    break;
+                }
+                if (chunkRead == 0)
                 {
                     break;
                 }
@@ -2042,6 +2271,7 @@ private:
                 if (chunkRead < 0)
                 {
                     result.clear();
+                    read.failed = true;
                     break;
                 }
 
@@ -2058,7 +2288,26 @@ private:
                     streamBuf.begin() + static_cast<std::ptrdiff_t>(chunkRead));
             }
         }
-        return result;
+        return read;
+    }
+
+    // Decompressor memory of one cursor, estimated before any is opened:
+    // libarchive does not report the dictionary size. 7-Zip and WinRAR never
+    // use a dictionary larger than the data (rounded up to a power of two) and
+    // their defaults stop at 64 MiB (7-Zip -mx9 LZMA2); add libarchive's
+    // buffers and this reader's 64 KiB block. Measured on a 64 MiB-dictionary
+    // LZMA2 7z: see README ("Forward cursors").
+    static uint64_t CursorMemoryEstimate(uint64_t unpackedBytes)
+    {
+        constexpr uint64_t kMinDictionary = 1ull << 20;
+        constexpr uint64_t kMaxDictionary = 64ull << 20;
+        constexpr uint64_t kBuffers = 2ull << 20;
+        uint64_t dictionary = kMinDictionary;
+        while (dictionary < unpackedBytes && dictionary < kMaxDictionary)
+        {
+            dictionary <<= 1;
+        }
+        return dictionary + kBuffers;
     }
 
     void ScanArchive(std::stop_token stop)
@@ -2079,6 +2328,10 @@ private:
             }
             return;
         }
+        m_identity = session.source->Identity();
+        // The same file through its path: compared with the path's identity
+        // when a cursor resumes, so both sides come from one kind of query.
+        m_pathIdentity = FileIdentityOfPath(m_path);
 
         // Get format name
         const char* formatName = archive_format_name(a);
@@ -2087,6 +2340,8 @@ private:
             m_formatName = Utf8ToWide(formatName);
         }
 
+        std::unordered_map<std::string, size_t> firstOrdinal;
+        uint64_t unpackedBytes = 0;
         struct archive_entry* entry;
         while (true)
         {
@@ -2107,6 +2362,7 @@ private:
                 }
                 break;
             }
+            const size_t ordinal = m_headerCount++;
 
             // archive_entry_pathname() is in the CRT locale's code page (Latin-1
             // or '?' in the "C" locale); the UTF-8 view keeps every name intact.
@@ -2122,12 +2378,22 @@ private:
             archEntry.compressedSize = 0; // libarchive doesn't always provide this
             archEntry.isDirectory = (archive_entry_filetype(entry) == AE_IFDIR);
             archEntry.modTime = archive_entry_mtime(entry);
+            if (!archEntry.isDirectory && archive_entry_size_is_set(entry))
+            {
+                unpackedBytes += archEntry.size;
+            }
 
             size_t index = m_entries.size();
             m_directories.Add(archEntry);
             m_entries.push_back(archEntry);
             m_entryMap[ArchiveInnerPathKey(archEntry.name)] = index;
+            m_entryOrdinal.push_back(firstOrdinal.try_emplace(name, ordinal).first->second);
         }
+
+        // Known once a header was read.
+        const int format = archive_format(a) & ARCHIVE_FORMAT_BASE_MASK;
+        m_sequential = format == ARCHIVE_FORMAT_7ZIP || format == ARCHIVE_FORMAT_RAR || format == ARCHIVE_FORMAT_RAR_V5;
+        m_cursorEstimate = CursorMemoryEstimate(unpackedBytes);
     }
 };
 #endif
@@ -2193,6 +2459,36 @@ bool IArchiveReader::ExtractBatch(const std::vector<std::wstring>& entryPaths, s
     return !stop.stop_requested();
 }
 
+IArchiveReader::ExtractResult IArchiveReader::ExtractForward(
+    const std::vector<std::wstring>& entryPaths,
+    std::stop_token stop,
+    const ForwardSink& onEntry,
+    const ExtractOptions&)
+{
+    // Random access: ExtractBatch, ended early through a stop of our own.
+    std::stop_source local;
+    const std::stop_callback forward(stop, [&local] { local.request_stop(); });
+    bool ended = false;
+    const bool completed = ExtractBatch(entryPaths, local.get_token(), [&](const std::wstring& path, std::vector<uint8_t>&& data)
+    {
+        if (!onEntry(path, std::move(data)))
+        {
+            ended = true;
+            local.request_stop();
+        }
+    });
+    if (ended)
+    {
+        return ExtractResult::EndedBySink;
+    }
+    return (completed && !stop.stop_requested()) ? ExtractResult::Completed : ExtractResult::Stopped;
+}
+
+size_t IArchiveReader::ArchiveOrder(const std::wstring&) const
+{
+    return kNoArchiveOrder;
+}
+
 size_t ArchiveReaderFactory::ExtractionHeaderCountForTesting()
 {
     return g_extractionHeaders.load();
@@ -2201,6 +2497,17 @@ size_t ArchiveReaderFactory::ExtractionHeaderCountForTesting()
 size_t ArchiveReaderFactory::LibArchiveBytesReadForTesting()
 {
     return g_sourceBytes.load();
+}
+
+void ArchiveReaderFactory::SetLibArchiveReadHookForTesting(std::function<bool(uint64_t offset)> hook)
+{
+#if FLOAR_ENABLE_COMMON_ARCHIVES
+    g_hasReadHook = false;
+    g_readHook = std::move(hook);
+    g_hasReadHook = static_cast<bool>(g_readHook);
+#else
+    (void)hook;
+#endif
 }
 
 size_t ArchiveReaderFactory::OpenCountForTesting()
@@ -2214,6 +2521,12 @@ std::unique_ptr<IArchiveReader> ArchiveReaderFactory::Open(const std::filesystem
 }
 
 std::unique_ptr<IArchiveReader> ArchiveReaderFactory::Open(const std::filesystem::path& path, std::stop_token stop)
+{
+    return Open(path, stop, nullptr);
+}
+
+std::unique_ptr<IArchiveReader> ArchiveReaderFactory::Open(
+    const std::filesystem::path& path, std::stop_token stop, std::shared_ptr<ArchiveCursorPool> cursorPool)
 {
     ++g_opens;
     if (stop.stop_requested())
@@ -2246,7 +2559,7 @@ std::unique_ptr<IArchiveReader> ArchiveReaderFactory::Open(const std::filesystem
         }
 
 #if FLOAR_ENABLE_COMMON_ARCHIVES
-        auto reader = std::make_unique<LibArchiveReader>(path, stop);
+        auto reader = std::make_unique<LibArchiveReader>(path, stop, std::move(cursorPool));
         if (stop.stop_requested() || reader->Entries().empty())
         {
             return nullptr;   // canceled scans are never returned

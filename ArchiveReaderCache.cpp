@@ -44,32 +44,6 @@ std::wstring ArchiveReaderCache::Key(const std::filesystem::path& archivePath)
     return HostPathKey(Resolve(archivePath));
 }
 
-ArchiveReaderCache::Identity ArchiveReaderCache::ReadIdentity(const std::filesystem::path& archivePath)
-{
-    // One attribute query: directory_entry caches size and write time.
-    Identity identity {};
-    std::error_code ec;
-    const std::filesystem::directory_entry entry(archivePath, ec);
-    if (ec)
-    {
-        return identity;
-    }
-    const std::uintmax_t size = entry.file_size(ec);
-    if (ec)
-    {
-        return identity;
-    }
-    const std::filesystem::file_time_type writeTime = entry.last_write_time(ec);
-    if (ec)
-    {
-        return identity;
-    }
-    identity.known = true;
-    identity.size = size;
-    identity.writeTime = writeTime;
-    return identity;
-}
-
 std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::path& archivePath, std::stop_token stop)
 {
     {
@@ -83,7 +57,8 @@ std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::p
     // One absolute path for the key, the change check and the open.
     const std::filesystem::path path = Resolve(archivePath);
     const std::wstring key = HostPathKey(path);
-    const Identity identity = ReadIdentity(path);
+    bool missing = false;
+    const Identity identity = FileIdentityOfPath(path, &missing);
 
     std::unique_lock<std::mutex> lock(m_mutex);
     if (m_shutdown)
@@ -104,10 +79,14 @@ std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::p
         m_nodes.emplace(key, Node { slot, m_lru.begin() });
     }
     ++slot->activeLookups;   // pins the slot against eviction
-    EvictLocked();
+    std::vector<std::shared_ptr<Slot>> evicted;
+    EvictLocked(evicted);
 
     std::shared_ptr<IArchiveReader> reader;
-    if (slot->reader && (!identity.known || slot->identity == identity))
+    // Not found: keep the reader (its reads fail on their own if the file is
+    // gone). Unreadable, now or when the reader was opened: never reused.
+    const bool keepWhileMissing = !identity.known && missing;
+    if (slot->reader && (keepWhileMissing || (identity.known && slot->identity == identity)))
     {
         reader = slot->reader;
     }
@@ -163,8 +142,29 @@ std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::p
             m_nodes.erase(it);
         }
     }
-    EvictLocked();   // entries skipped while pinned
+    EvictLocked(evicted);   // entries skipped while pinned
+    lock.unlock();
+    ReleaseEvicted(evicted);
     return reader;
+}
+
+void ArchiveReaderCache::ReleaseEvicted(std::vector<std::shared_ptr<Slot>>& evicted)
+{
+    // New lookups get a new reader: an evicted one keeps serving its current
+    // callers but retains no cursor (closed here, outside the cache lock).
+    for (const auto& slot : evicted)
+    {
+        std::shared_ptr<IArchiveReader> reader;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            reader = slot->reader;
+        }
+        if (reader)
+        {
+            reader->ReleaseIdleCursors();
+        }
+    }
+    evicted.clear();
 }
 
 void ArchiveReaderCache::RetireLocked(const std::shared_ptr<Operation>& operation)
@@ -313,6 +313,20 @@ void ArchiveReaderCache::WorkerMain(Worker* self)
         }
         lock.lock();
 
+        if (reader && !operation->retired && operation->generation > operation->slot->publishedGeneration &&
+            operation->slot->reader && operation->slot->reader != reader)
+        {
+            // A newer generation (the file changed) is about to replace the
+            // published reader, whose cursors read the old content: close them
+            // before any caller sees the new one, outside the lock (still
+            // counted as running, so Shutdown retires it meanwhile). Callers
+            // still holding the old reader keep using it, without cursors.
+            std::shared_ptr<IArchiveReader> stale = operation->slot->reader;
+            lock.unlock();
+            stale->ReleaseIdleCursors();
+            stale.reset();
+            lock.lock();
+        }
         // Out of the opener: no OS cancel targets this worker from here on.
         operation->worker = nullptr;
         self->operation.reset();
@@ -439,7 +453,7 @@ bool ArchiveReaderCache::Shutdown(std::chrono::milliseconds bound)
     return true;
 }
 
-void ArchiveReaderCache::EvictLocked()
+void ArchiveReaderCache::EvictLocked(std::vector<std::shared_ptr<Slot>>& evicted)
 {
     auto it = m_lru.end();
     while (m_nodes.size() > m_capacity && it != m_lru.begin())
@@ -450,6 +464,7 @@ void ArchiveReaderCache::EvictLocked()
         {
             continue;   // in use: keep its coordination state
         }
+        evicted.push_back(node->second.slot);
         m_nodes.erase(node);
         it = m_lru.erase(it);
     }

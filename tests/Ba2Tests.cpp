@@ -226,3 +226,37 @@ FLOAR_TEST(Ba2_Dx10PayloadWithDdsHeaderIsReturnedAsIs)
     std::error_code ec;
     std::filesystem::remove(path, ec);
 }
+
+FLOAR_TEST(Ba2_RandomAccessUsesNoCursor)
+{
+    const auto chunks = ThreeChunks();
+    const auto path = WriteTemp(L"cursorless", BuildDx10Ba2("textures/stone.dds", chunks));
+    const auto pool = std::make_shared<ArchiveCursorPool>();
+    auto reader = ArchiveReaderFactory::Open(path, {}, pool);
+    FLOAR_REQUIRE(reader != nullptr);
+    FLOAR_CHECK(!reader->HasExpensiveRandomAccess());
+    FLOAR_CHECK(reader->ArchiveOrder(L"textures/stone.dds") == IArchiveReader::kNoArchiveOrder);
+
+    const std::vector<uint8_t> expected = reader->ExtractToMemory(L"textures/stone.dds");
+    FLOAR_REQUIRE(!expected.empty());
+    // ExtractForward is ExtractBatch for random-access readers: request order,
+    // one direct read per entry, and an early end stops before the next read.
+    const size_t handlesBefore = ArchiveReaderFactory::DataHandleOpenCountForTesting();
+    std::vector<std::wstring> order;
+    const auto result = reader->ExtractForward({ L"missing.dds", L"textures/stone.dds", L"Textures\\Stone.dds" }, {},
+        [&](const std::wstring& entryPath, std::vector<uint8_t>&& data)
+        {
+            order.push_back(entryPath);
+            FLOAR_CHECK(entryPath == L"missing.dds" ? data.empty() : data == expected);
+            return order.size() < 2;
+        }, {});
+    FLOAR_CHECK(result == IArchiveReader::ExtractResult::EndedBySink);
+    FLOAR_CHECK(order == (std::vector<std::wstring> { L"missing.dds", L"textures/stone.dds" }));
+    FLOAR_CHECK(ArchiveReaderFactory::DataHandleOpenCountForTesting() == handlesBefore + 1);
+    FLOAR_CHECK(pool->Stats().opens == 0);
+    FLOAR_CHECK(pool->Stats().idle == 0);
+
+    reader.reset();
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
