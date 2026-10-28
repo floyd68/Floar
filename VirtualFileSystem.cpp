@@ -36,8 +36,11 @@ namespace
     // The whole file, or empty: a file that cannot be opened, is empty or
     // larger than kMaxPlainFileSize, or whose read fails or ends before the
     // size queried at open (EOF, an OS error such as ERROR_OPERATION_ABORTED)
-    // returns no data, never a partly filled buffer.
-    std::vector<uint8_t> ReadPlainFile(const std::filesystem::path& path)
+    // returns no data, never a partly filled buffer. One allocation; the data
+    // is read in kPlainFileReadChunk chunks with a stop check before each one
+    // and before returning, so a stop discards the data after at most one more
+    // chunk read (which itself is not interrupted).
+    std::vector<uint8_t> ReadPlainFile(const std::filesystem::path& path, std::stop_token stop)
     {
         FileHandle file;
         file.handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
@@ -54,16 +57,37 @@ namespace
         }
 
         std::vector<uint8_t> data(static_cast<size_t>(size.QuadPart));
-        DWORD read = 0;
-        if (!::ReadFile(file.handle, data.data(), static_cast<DWORD>(data.size()), &read, nullptr))
+        size_t offset = 0;
+        while (offset < data.size())
         {
-            const DWORD error = GetLastError();
-            FLOAR_LOG_WARN("[VFS] Plain file read failed (error {}): {}", error, Log::ToUtf8(path));
-            return {};
+            if (stop.stop_requested())
+            {
+                return {};
+            }
+            const DWORD chunk = static_cast<DWORD>((std::min)(data.size() - offset, VirtualFileSystem::kPlainFileReadChunk));
+            DWORD read = 0;
+            if (!::ReadFile(file.handle, data.data() + offset, chunk, &read, nullptr))
+            {
+                const DWORD error = GetLastError();
+                if (error == ERROR_OPERATION_ABORTED)
+                {
+                    // The caller's CancelSynchronousIo.
+                    FLOAR_LOG_DEBUG("[VFS] Plain file read aborted at {} of {} bytes: {}", offset, data.size(), Log::ToUtf8(path));
+                    return {};
+                }
+                FLOAR_LOG_WARN("[VFS] Plain file read failed at {} of {} bytes (error {}): {}",
+                    offset, data.size(), error, Log::ToUtf8(path));
+                return {};
+            }
+            offset += read;
+            if (read != chunk)
+            {
+                FLOAR_LOG_WARN("[VFS] Plain file ended at {} of {} bytes: {}", offset, data.size(), Log::ToUtf8(path));
+                return {};
+            }
         }
-        if (read != data.size())
+        if (stop.stop_requested())
         {
-            FLOAR_LOG_WARN("[VFS] Plain file ended at {} of {} bytes: {}", read, data.size(), Log::ToUtf8(path));
             return {};
         }
         return data;
@@ -146,7 +170,7 @@ std::vector<uint8_t> VirtualFileSystem::ReadFile(const VirtualPath& filePath, st
         }
         return data;
     }
-    return ReadPlainFile(filePath.hostPath);
+    return ReadPlainFile(filePath.hostPath, stop);
 }
 
 bool VirtualFileSystem::Exists(const VirtualPath& path)

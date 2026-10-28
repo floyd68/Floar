@@ -1,6 +1,7 @@
 #pragma once
 
 #include "VirtualPath.h"
+#include <cstddef>
 #include <functional>
 #include <stop_token>
 #include <vector>
@@ -31,6 +32,9 @@ struct VirtualFileEntry
 class VirtualFileSystem
 {
 public:
+    // Plain files are read in chunks of this size, with a stop check between them.
+    static constexpr size_t kPlainFileReadChunk = 2 * 1024 * 1024;
+
     static std::vector<VirtualFileEntry> ListDirectory(const VirtualPath& dirPath);
 
     // Streams the children of `dirPath` (a folder, an archive, or a folder in
@@ -68,7 +72,13 @@ public:
     // interrupted by a stop check. Extraction and plain-file reads
     // run on the calling thread (its owner may add CancelSynchronousIo); the
     // archive open runs on a cache worker. Plain files: stop is checked before
-    // the file is opened; the read itself is not interrupted.
+    // the file is opened, then the file is read into one buffer in
+    // kPlainFileReadChunk chunks with a stop check before each chunk and
+    // before the data is returned, so a stop returns empty data after at most
+    // one more chunk. One chunk's OS read can still block for its whole
+    // duration (a network path, an online-only OneDrive file) and is not
+    // interrupted by a stop check; only the caller's CancelSynchronousIo on
+    // this thread can end it (the read then fails and returns empty data).
     static std::vector<uint8_t> ReadFile(const VirtualPath& filePath, std::stop_token stop);
     // The same, with archive readers from `cache` (an injected opener in tests).
     static std::vector<uint8_t> ReadFile(const VirtualPath& filePath, std::stop_token stop, ArchiveReaderCache& cache);
