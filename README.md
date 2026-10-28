@@ -50,7 +50,8 @@ unless `ArchiveReaderFactory::Open` is given another pool):
   it scanned (the change check `ArchiveReaderCache` uses). A retained cursor is
   refused once the path's identity differs, and a newly opened handle whose
   file differs is not read: an old reader returns empty data rather than the
-  new file's content.
+  new file's content. `ArchiveReaderCache` closes the idle cursors of a reader
+  it replaces (file changed) or evicts.
 - Limits (`ArchiveCursorLimits`, `SetLimits`): active cursors process-wide
   (default 3) and per reader (2), of which `reservedForHigh` (1) only High
   requests may use, so Normal work gets 2 and 1; idle cursors process-wide (2)

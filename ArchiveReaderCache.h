@@ -69,6 +69,9 @@ namespace Floar
 //   progress (opening, or waiting for its open) is never evicted, so its
 //   operation survives and it is never opened twice for one generation; the
 //   cache may exceed its capacity until those lookups finish.
+// - Cursors: a reader that is evicted, or replaced because its file changed,
+//   has its idle forward cursors closed (IArchiveReader::ReleaseIdleCursors),
+//   outside the cache lock; callers still holding it keep using it.
 // - Lifetime: hosts and test executables call Shutdown(bound) before static
 //   teardown (also for Shared()). The destructor joins the workers without a
 //   bound and never detaches them.
@@ -183,8 +186,10 @@ private:
 
     static std::filesystem::path Resolve(const std::filesystem::path& archivePath);
     static Identity ReadIdentity(const std::filesystem::path& archivePath);
-    // Evicts least-recently-used entries without an active lookup.
-    void EvictLocked();
+    // Evicts least-recently-used entries without an active lookup, into `evicted`.
+    void EvictLocked(std::vector<std::shared_ptr<Slot>>& evicted);
+    // Closes the idle cursors of evicted readers (not under m_mutex).
+    void ReleaseEvicted(std::vector<std::shared_ptr<Slot>>& evicted);
     // Stops `operation` for good and releases its waiters with null.
     void RetireLocked(const std::shared_ptr<Operation>& operation);
     // Starts a worker when queued opens exceed the idle workers and the bound allows it.

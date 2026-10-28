@@ -609,6 +609,60 @@ FLOAR_TEST(CursorRead_ReplacedArchiveIsNeverServedFromOldCursors)
     }
 }
 
+FLOAR_TEST(CursorRead_CacheClosesTheCursorsOfAReplacedReader)
+{
+    Fixture fixture(L"replace2");
+    FLOAR_REQUIRE(fixture.written);
+    const auto replacement = fixture.dir.path / L"replacement.7z";
+    FLOAR_REQUIRE(WriteFixture(replacement, 'k'));
+    const auto pool = NewPool();
+
+    // The replaced reader's idle cursors are closed when the new reader is
+    // published, and the new reader reads the new content.
+    ArchiveReaderCache cache(4, [pool](const std::filesystem::path& path, std::stop_token stop)
+    {
+        return std::shared_ptr<IArchiveReader>(ArchiveReaderFactory::Open(path, stop, pool));
+    });
+    const auto oldReader = cache.Get(fixture.archive);
+    FLOAR_REQUIRE(oldReader != nullptr);
+    FLOAR_CHECK(oldReader->ExtractToMemory(EntryName(2)) == Bytes(EntryData(2)));
+    FLOAR_REQUIRE(pool->Stats().idle == 1);
+    FLOAR_REQUIRE(OverwriteInPlace(replacement, fixture.archive));
+    const auto newReader = cache.Get(fixture.archive);
+    FLOAR_REQUIRE(newReader != nullptr);
+    FLOAR_CHECK(newReader != oldReader);
+    FLOAR_CHECK(pool->Stats().idle == 0);
+    FLOAR_CHECK(oldReader->ExtractToMemory(EntryName(3)).empty());
+    FLOAR_CHECK(newReader->ExtractToMemory(EntryName(3)) == Bytes(EntryData(3, 'k')));
+    // A released reader retains no cursor from then on.
+    FLOAR_CHECK(oldReader->ExtractToMemory(EntryName(4)).empty());
+    FLOAR_CHECK(pool->Stats().idle == 1);   // the new reader's only
+    FLOAR_CHECK(cache.Shutdown(5s));
+}
+
+FLOAR_TEST(CursorRead_EvictedReaderClosesItsIdleCursors)
+{
+    Fixture fixture(L"evict");
+    FLOAR_REQUIRE(fixture.written);
+    const auto other = fixture.dir.path / L"other.7z";
+    FLOAR_REQUIRE(WriteFixture(other, 'k'));
+    const auto pool = NewPool();
+    ArchiveReaderCache cache(1, [pool](const std::filesystem::path& path, std::stop_token stop)
+    {
+        return std::shared_ptr<IArchiveReader>(ArchiveReaderFactory::Open(path, stop, pool));
+    });
+    FLOAR_CHECK(VirtualFileSystem::ReadFile(VirtualPath(fixture.archive, EntryName(0)), {}, cache) == Bytes(EntryData(0)));
+    FLOAR_CHECK(pool->Stats().idle == 1);
+    // Capacity 1: opening another archive evicts the first reader.
+    FLOAR_CHECK(VirtualFileSystem::ReadFile(VirtualPath(other, EntryName(0)), {}, cache) == Bytes(EntryData(0, 'k')));
+    const auto stats = pool->Stats();
+    FLOAR_CHECK(stats.idle == 1);   // the second archive's only
+    FLOAR_CHECK(stats.evicted == 1);
+    FLOAR_CHECK(cache.Shutdown(5s));
+    // Shutdown released the readers, and with them every cursor.
+    FLOAR_CHECK(pool->Stats().idle == 0);
+}
+
 FLOAR_TEST(CursorRead_ConcurrentExtractionReturnsCorrectBytes)
 {
     Fixture first(L"conc1");

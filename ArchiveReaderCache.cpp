@@ -104,7 +104,8 @@ std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::p
         m_nodes.emplace(key, Node { slot, m_lru.begin() });
     }
     ++slot->activeLookups;   // pins the slot against eviction
-    EvictLocked();
+    std::vector<std::shared_ptr<Slot>> evicted;
+    EvictLocked(evicted);
 
     std::shared_ptr<IArchiveReader> reader;
     if (slot->reader && (!identity.known || slot->identity == identity))
@@ -163,8 +164,29 @@ std::shared_ptr<IArchiveReader> ArchiveReaderCache::Get(const std::filesystem::p
             m_nodes.erase(it);
         }
     }
-    EvictLocked();   // entries skipped while pinned
+    EvictLocked(evicted);   // entries skipped while pinned
+    lock.unlock();
+    ReleaseEvicted(evicted);
     return reader;
+}
+
+void ArchiveReaderCache::ReleaseEvicted(std::vector<std::shared_ptr<Slot>>& evicted)
+{
+    // New lookups get a new reader: an evicted one keeps serving its current
+    // callers but retains no cursor (closed here, outside the cache lock).
+    for (const auto& slot : evicted)
+    {
+        std::shared_ptr<IArchiveReader> reader;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            reader = slot->reader;
+        }
+        if (reader)
+        {
+            reader->ReleaseIdleCursors();
+        }
+    }
+    evicted.clear();
 }
 
 void ArchiveReaderCache::RetireLocked(const std::shared_ptr<Operation>& operation)
@@ -313,6 +335,20 @@ void ArchiveReaderCache::WorkerMain(Worker* self)
         }
         lock.lock();
 
+        if (reader && !operation->retired && operation->generation > operation->slot->publishedGeneration &&
+            operation->slot->reader && operation->slot->reader != reader)
+        {
+            // A newer generation (the file changed) is about to replace the
+            // published reader, whose cursors read the old content: close them
+            // before any caller sees the new one, outside the lock (still
+            // counted as running, so Shutdown retires it meanwhile). Callers
+            // still holding the old reader keep using it, without cursors.
+            std::shared_ptr<IArchiveReader> stale = operation->slot->reader;
+            lock.unlock();
+            stale->ReleaseIdleCursors();
+            stale.reset();
+            lock.lock();
+        }
         // Out of the opener: no OS cancel targets this worker from here on.
         operation->worker = nullptr;
         self->operation.reset();
@@ -439,7 +475,7 @@ bool ArchiveReaderCache::Shutdown(std::chrono::milliseconds bound)
     return true;
 }
 
-void ArchiveReaderCache::EvictLocked()
+void ArchiveReaderCache::EvictLocked(std::vector<std::shared_ptr<Slot>>& evicted)
 {
     auto it = m_lru.end();
     while (m_nodes.size() > m_capacity && it != m_lru.begin())
@@ -450,6 +486,7 @@ void ArchiveReaderCache::EvictLocked()
         {
             continue;   // in use: keep its coordination state
         }
+        evicted.push_back(node->second.slot);
         m_nodes.erase(node);
         it = m_lru.erase(it);
     }
