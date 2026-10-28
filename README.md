@@ -70,3 +70,16 @@ Memory: libarchive does not report a cursor's dictionary size, so each reader
 estimates it once as its unpacked size rounded up to a power of two between
 1 MiB and 64 MiB (7-Zip's and WinRAR's default dictionaries stop at 64 MiB and
 are never larger than the data), plus 2 MiB of buffers.
+Measured with `FloarSolidCursorBench` (built with the tests, not run by ctest)
+on a generated 223 MiB solid 7z (7-Zip 26.05, LZMA2, 64 MiB dictionary, one solid
+block, 1,165 entries) reading the 40 files of a folder at its end
+(archive order 1125-1164), MinSizeRel:
+
+| | Archive opens | Headers read | First read | Each later read | 40 files |
+|---|---|---|---|---|---|
+| Restart per read (no retained cursor, as before) | 1 per read | up to the entry, per read | 8.7-9.2 s | 8.7-9.2 s | ~360 s (5 measured) |
+| Forward cursor | 1 | 1,165 in total | 9.1 s | 12.2-15.3 ms (median 12.6) | 9.5 s |
+
+One idle cursor on that archive raised the process's private bytes by
+64.6 MiB (2.7 MiB before, 67.3 MiB with the cursor, 2.7 MiB after `TrimIdle`);
+the reader's estimate was 66 MiB.

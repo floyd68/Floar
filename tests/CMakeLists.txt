@@ -66,3 +66,11 @@ target_link_libraries(FloarPlainReadBench PRIVATE Floar)
 if(MSVC)
     target_compile_options(FloarPlainReadBench PRIVATE /permissive- /utf-8)
 endif()
+
+# Opt-in forward-cursor benchmark for solid archives; not registered with ctest.
+add_executable(FloarSolidCursorBench SolidCursorBenchmark.cpp)
+target_compile_definitions(FloarSolidCursorBench PRIVATE UNICODE _UNICODE)
+target_link_libraries(FloarSolidCursorBench PRIVATE Floar psapi)
+if(MSVC)
+    target_compile_options(FloarSolidCursorBench PRIVATE /permissive- /utf-8)
+endif()
