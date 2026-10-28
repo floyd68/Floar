@@ -171,6 +171,12 @@ std::vector<uint8_t> VirtualFileSystem::ReadFile(const VirtualPath& filePath, st
 
 std::vector<uint8_t> VirtualFileSystem::ReadFile(const VirtualPath& filePath, std::stop_token stop, ArchiveReaderCache& cache)
 {
+    return ReadFile(filePath, stop, cache, IArchiveReader::ExtractOptions {});
+}
+
+std::vector<uint8_t> VirtualFileSystem::ReadFile(
+    const VirtualPath& filePath, std::stop_token stop, ArchiveReaderCache& cache, const IArchiveReader::ExtractOptions& options)
+{
     if (stop.stop_requested())
     {
         return {};
@@ -189,13 +195,14 @@ std::vector<uint8_t> VirtualFileSystem::ReadFile(const VirtualPath& filePath, st
         }
 
         std::vector<uint8_t> data;
-        const bool completed = reader->ExtractBatch({ filePath.archiveInnerPath }, stop,
+        const auto result = reader->ExtractForward({ filePath.archiveInnerPath }, stop,
             [&data](const std::wstring&, std::vector<uint8_t>&& entryData)
             {
                 data = std::move(entryData);
-            });
+                return true;
+            }, options);
         // Nothing partial or late: a stop during extraction drops the data.
-        if (!completed || stop.stop_requested())
+        if (result != IArchiveReader::ExtractResult::Completed || stop.stop_requested())
         {
             return {};
         }

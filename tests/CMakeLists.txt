@@ -9,6 +9,7 @@ add_executable(FloarTests
     Ba2Tests.cpp
     CancelReadTests.cpp
     CursorPoolTests.cpp
+    CursorTests.cpp
     LogTests.cpp
     OpenPoolTests.cpp
     PlainReadTests.cpp
@@ -53,9 +54,10 @@ add_test(NAME Floar.OpenPool COMMAND FloarTests Pool_)
 add_test(NAME Floar.CancelRead COMMAND FloarTests Cancel_)
 add_test(NAME Floar.PlainRead COMMAND FloarTests Plain_)
 add_test(NAME Floar.CursorPool COMMAND FloarTests CursorPool_)
+add_test(NAME Floar.CursorRead COMMAND FloarTests CursorRead_)
 # Safety net only: the tests contain no unbounded waits.
 set_tests_properties(Floar.Log Floar.Vfs Floar.Ba2 Floar.Streaming Floar.OpenPool Floar.CancelRead Floar.PlainRead
-    Floar.CursorPool PROPERTIES TIMEOUT 120)
+    Floar.CursorPool Floar.CursorRead PROPERTIES TIMEOUT 120)
 
 # Opt-in plain-file read throughput benchmark; not registered with ctest.
 add_executable(FloarPlainReadBench PlainReadBenchmark.cpp)

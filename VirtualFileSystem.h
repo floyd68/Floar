@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ArchiveReader.h"
 #include "VirtualPath.h"
 #include <cstddef>
 #include <cstdint>
@@ -84,6 +85,11 @@ public:
     static std::vector<uint8_t> ReadFile(const VirtualPath& filePath, std::stop_token stop);
     // The same, with archive readers from `cache` (an injected opener in tests).
     static std::vector<uint8_t> ReadFile(const VirtualPath& filePath, std::stop_token stop, ArchiveReaderCache& cache);
+    // The same with extraction options: an archive entry is read through
+    // IArchiveReader::ExtractForward with `options` (the priority of its
+    // cursor admission for 7z/RAR); the other overloads use Normal priority.
+    static std::vector<uint8_t> ReadFile(
+        const VirtualPath& filePath, std::stop_token stop, ArchiveReaderCache& cache, const IArchiveReader::ExtractOptions& options);
     // Test seam for plain-file reads (both ReadFile overloads), process-wide:
     // install it only while no other plain-file read runs, and clear it by
     // installing an empty hook. Both callbacks are optional and run on the
